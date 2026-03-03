@@ -40,7 +40,8 @@ def transcribe(audio_path, model_size="base"):
         result = model.transcribe(
             audio_path,
             word_timestamps=True,
-            verbose=False
+            verbose=False,
+            language="en"
         )
 
     # Extract word-level timestamps

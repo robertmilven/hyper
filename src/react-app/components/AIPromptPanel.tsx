@@ -239,6 +239,7 @@ export default function AIPromptPanel({
   const [showTimeRangePicker, setShowTimeRangePicker] = useState(false);
   const [timeRange, setTimeRange] = useState<TimeRange | null>(null);
   const [timeRangeInputs, setTimeRangeInputs] = useState({ start: '', end: '' });
+  const [timeRangeError, setTimeRangeError] = useState<string | null>(null);
   const [showMotionGraphicsModal, setShowMotionGraphicsModal] = useState(false);
   const [attachedAssets, setAttachedAssets] = useState<AttachedAsset[]>([]);
   const [isUploadingAttachment, setIsUploadingAttachment] = useState(false);
@@ -254,6 +255,7 @@ export default function AIPromptPanel({
   });
   const [pendingQuestion, setPendingQuestion] = useState<ClarifyingQuestion | null>(null);
   const [pendingAnimationConcept, setPendingAnimationConcept] = useState<AnimationConcept | null>(null);
+  const [applyingIndex, setApplyingIndex] = useState<number | null>(null);
 
   // Intentionally unused - kept for backwards compatibility
   void _onCreateContextualAnimation;
@@ -364,16 +366,28 @@ export default function AIPromptPanel({
     const start = parseTimeString(timeRangeInputs.start);
     const end = parseTimeString(timeRangeInputs.end);
 
-    if (start !== null && end !== null && end > start) {
-      setTimeRange({ start, end });
-      setShowTimeRangePicker(false);
+    if (start === null || end === null) {
+      setTimeRangeError('Use M:SS format (e.g. 0:03, 0:33) — not decimal seconds');
+      return;
     }
+    if (end <= start) {
+      setTimeRangeError('End time must be after start time');
+      return;
+    }
+    if (end - start < 1) {
+      setTimeRangeError(`Range is only ${((end - start) * 1000).toFixed(0)}ms — did you mean M:SS? e.g. 0:03`);
+      return;
+    }
+    setTimeRangeError(null);
+    setTimeRange({ start, end });
+    setShowTimeRangePicker(false);
   };
 
   // Clear time range
   const clearTimeRange = () => {
     setTimeRange(null);
     setTimeRangeInputs({ start: '', end: '' });
+    setTimeRangeError(null);
   };
 
   // Add a reference (or attach asset for animation if it's an image/video)
@@ -700,7 +714,7 @@ export default function AIPromptPanel({
   };
 
   // Handle contextual animation workflow (analyzes first, shows concept for approval)
-  const handleContextualAnimationWorkflow = async (type: 'intro' | 'outro' | 'transition' | 'highlight', description?: string) => {
+  const handleContextualAnimationWorkflow = async (type: 'intro' | 'outro' | 'transition' | 'highlight', description?: string, timeRange?: { start: number; end: number }) => {
     if (!onAnalyzeForAnimation) return;
 
     setIsProcessing(true);
@@ -715,17 +729,19 @@ export default function AIPromptPanel({
     setProcessingStatus(`Analyzing video for ${typeLabels[type]}...`);
 
     try {
+      const rangeStr = timeRange ? ` (${formatTimeShort(timeRange.start)}-${formatTimeShort(timeRange.end)})` : '';
       setChatHistory(prev => [...prev, {
         type: 'assistant',
-        text: `🎬 Analyzing your video for a contextual ${typeLabels[type]}...\n\n1. Transcribing video to understand content\n2. Identifying key themes and topics\n3. Designing animation scenes\n\nPlease wait...`,
+        text: `🎬 Analyzing your video${rangeStr} for a contextual ${typeLabels[type]}...\n\n1. Transcribing${timeRange ? ' selected segment' : ' video'} to understand content\n2. Identifying key themes and topics\n3. Designing animation scenes\n\nPlease wait...`,
         isProcessingGifs: true,
       }]);
 
-      // Step 1: Analyze the video and get the concept
-      const { concept } = await onAnalyzeForAnimation({ type, description });
+      // Step 1: Analyze the video and get the concept, passing time range if specified
+      const { concept } = await onAnalyzeForAnimation({ type, description, timeRange });
 
-      // Store the concept for approval
-      setPendingAnimationConcept(concept);
+      // Store the concept with start time for placement on approval
+      const conceptWithTime = timeRange ? { ...concept, startTime: timeRange.start } : concept;
+      setPendingAnimationConcept(conceptWithTime);
 
       // Update chat to show the concept for approval
       setChatHistory(prev => {
@@ -985,13 +1001,7 @@ export default function AIPromptPanel({
       return 'extract-audio';
     }
 
-    // Chapter cuts
-    if (lower.includes('chapter') || lower.includes('split into sections') ||
-        lower.includes('segment') || (lower.includes('cut') && lower.includes('topic'))) {
-      return 'chapter-cuts';
-    }
-
-    // GIF-related requests
+    // GIF-related requests — check before chapter-cuts so "add gif at each chapter" picks GIF
     if (lower.includes('gif') || lower.includes('giphy') ||
         (lower.includes('add') && lower.includes('meme'))) {
       return 'auto-gif';
@@ -1030,16 +1040,17 @@ export default function AIPromptPanel({
       return 'contextual-animation';
     }
 
-    // Batch animations (multiple animations across the video)
-    // Patterns: "add 5 animations", "create 3 animations", "generate animations throughout"
+    // Batch animations (multiple animations across the video) — check before chapter-cuts
+    // so "add 5 animations at each chapter" routes here, not to chapter-cuts
     const batchAnimationMatch = lower.match(/(?:add|create|generate|make)\s+(\d+)\s+animation/i) ||
                                 lower.match(/(\d+)\s+animation/i);
     if (batchAnimationMatch ||
-        (lower.includes('animations') && (lower.includes('throughout') || lower.includes('across') || lower.includes('multiple')))) {
+        (lower.includes('animations') && (lower.includes('throughout') || lower.includes('across') || lower.includes('multiple') || lower.includes('chapter') || lower.includes('each')))) {
       return 'batch-animations';
     }
 
-    // Create new animation (explicit creation requests)
+    // Create new animation (explicit creation requests) — check before chapter-cuts
+    // so "create animation for each chapter" routes here
     if ((lower.includes('create') || lower.includes('make') || lower.includes('generate') ||
          lower.includes('add') || lower.includes('build') || lower.includes('design')) &&
         (lower.includes('animation') || lower.includes('animated') || lower.includes('motion') ||
@@ -1047,6 +1058,12 @@ export default function AIPromptPanel({
          lower.includes('intro') || lower.includes('outro') || lower.includes('title card') ||
          lower.includes('text overlay') || lower.includes('infographic') || lower.includes('scene'))) {
       return 'create-animation';
+    }
+
+    // Chapter cuts — only when NOT asking for animations/GIFs
+    if (lower.includes('chapter') || lower.includes('split into sections') ||
+        lower.includes('segment') || (lower.includes('cut') && lower.includes('topic'))) {
+      return 'chapter-cuts';
     }
 
     // Remotion animation keywords without explicit create/make verbs
@@ -1084,17 +1101,23 @@ export default function AIPromptPanel({
       return 'create-animation';
     }
 
-    // FFmpeg-style video edits (trim, cut, speed, etc.)
+    // FFmpeg-style video edits (trim, cut, speed, audio, noise, etc.)
     if (lower.includes('trim') || lower.includes('cut') || lower.includes('speed') ||
         lower.includes('slow') || lower.includes('fast') || lower.includes('reverse') ||
         lower.includes('crop') || lower.includes('rotate') || lower.includes('flip') ||
-        lower.includes('brightness') || lower.includes('contrast') || lower.includes('filter')) {
+        lower.includes('brightness') || lower.includes('contrast') || lower.includes('filter') ||
+        lower.includes('noise') || lower.includes('denoise') || lower.includes('background noise') ||
+        lower.includes('volume') || lower.includes('audio level') || lower.includes('normalize') ||
+        lower.includes('fade in') || lower.includes('fade out') || lower.includes('mute') ||
+        lower.includes('stabilize') || lower.includes('sharpen') || lower.includes('blur') ||
+        lower.includes('saturation') || lower.includes('hue') || lower.includes('exposure') ||
+        lower.includes('color correct') || lower.includes('colour correct') ||
+        lower.includes('resize') || lower.includes('scale') || lower.includes('compress')) {
       return 'ffmpeg-edit';
     }
 
-    // Default: for creative/visual requests, prefer animation over FFmpeg
-    // Only use ffmpeg-edit when the user clearly wants video manipulation
-    return 'create-animation';
+    // Default: if nothing matched, treat as an ffmpeg edit (safer than assuming animation)
+    return 'ffmpeg-edit';
   };
 
   // Handle chapter cuts workflow
@@ -2183,7 +2206,7 @@ export default function AIPromptPanel({
     if (workflow === 'contextual-animation') {
       const contextualCheck = isContextualAnimationPrompt(userMessage);
       if (contextualCheck.isMatch) {
-        await handleContextualAnimationWorkflow(contextualCheck.type, userMessage);
+        await handleContextualAnimationWorkflow(contextualCheck.type, userMessage, savedTimeRange ?? undefined);
         return;
       }
       // Fall through to create-animation if contextual check didn't match
@@ -2256,8 +2279,9 @@ export default function AIPromptPanel({
   };
 
   const handleApplyEdit = async (command: string, messageIndex: number) => {
-    if (!onApplyEdit || !hasVideo) return;
+    if (!onApplyEdit || !hasVideo || applyingIndex !== null) return;
 
+    setApplyingIndex(messageIndex);
     try {
       await onApplyEdit(command);
       // Mark this message as applied
@@ -2273,6 +2297,8 @@ export default function AIPromptPanel({
           text: `Failed to apply edit: ${error instanceof Error ? error.message : 'Unknown error'}`,
         },
       ]);
+    } finally {
+      setApplyingIndex(null);
     }
   };
 
@@ -2500,25 +2526,21 @@ export default function AIPromptPanel({
                         {message.applied ? (
                           <div className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-emerald-500/20 rounded-lg text-xs font-medium text-emerald-400">
                             <CheckCircle className="w-3 h-3" />
-                            Edit Applied
+                            ✅ Edit Applied
+                          </div>
+                        ) : applyingIndex === idx ? (
+                          <div className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-zinc-700 rounded-lg text-xs font-medium text-zinc-300">
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                            Applying edit... (this may take a minute)
                           </div>
                         ) : (
                           <button
                             onClick={() => handleApplyEdit(message.command!, idx)}
-                            disabled={isApplying || !hasVideo}
+                            disabled={isApplying || !hasVideo || applyingIndex !== null}
                             className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 disabled:from-zinc-700 disabled:to-zinc-700 rounded-lg text-xs font-medium transition-all"
                           >
-                            {isApplying ? (
-                              <>
-                                <Loader2 className="w-3 h-3 animate-spin" />
-                                Processing...
-                              </>
-                            ) : (
-                              <>
-                                <CheckCircle className="w-3 h-3" />
-                                Apply Edit
-                              </>
-                            )}
+                            <CheckCircle className="w-3 h-3" />
+                            Apply Edit
                           </button>
                         )}
                       </div>
@@ -2862,13 +2884,13 @@ export default function AIPromptPanel({
                   type="button"
                   onClick={() => {
                     if (!showTimeRangePicker) {
-                      // Get video duration from assets or use a default
                       const videoAsset = assets.find(a => a.type === 'video');
-                      const videoDuration = videoAsset?.duration || 60;
+                      const videoDuration = (videoAsset?.duration && videoAsset.duration > 0) ? videoAsset.duration : Infinity;
                       setTimeRangeInputs({
                         start: formatTimeShort(currentTime),
                         end: formatTimeShort(Math.min(currentTime + 30, videoDuration)),
                       });
+                      setTimeRangeError(null);
                     }
                     setShowTimeRangePicker(!showTimeRangePicker);
                   }}
@@ -2911,9 +2933,13 @@ export default function AIPromptPanel({
                       </div>
                     </div>
 
-                    <div className="text-[10px] text-zinc-500 mt-2 mb-3">
-                      Format: M:SS (e.g., 1:30)
-                    </div>
+                    {timeRangeError ? (
+                      <div className="text-[10px] text-red-400 mt-2 mb-3">{timeRangeError}</div>
+                    ) : (
+                      <div className="text-[10px] text-zinc-500 mt-2 mb-3">
+                        Format: M:SS — e.g. 0:03, 0:33 (use colon, not dot)
+                      </div>
+                    )}
 
                     <div className="flex gap-2">
                       {timeRange && (

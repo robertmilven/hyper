@@ -166,11 +166,13 @@ export function useProject() {
   const tracksRef = useRef(tracks);
   const clipsRef = useRef(clips);
   const settingsRef = useRef(settings);
+  const captionDataRef = useRef(captionData);
 
   // Keep refs in sync with state
   useEffect(() => { tracksRef.current = tracks; }, [tracks]);
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
+  useEffect(() => { captionDataRef.current = captionData; }, [captionData]);
 
   // Wrapper to persist session to localStorage
   const setSession = useCallback((sessionOrUpdater: SessionInfo | null | ((prev: SessionInfo | null) => SessionInfo | null)) => {
@@ -701,6 +703,20 @@ export function useProject() {
     return newClips;
   }, []);
 
+  // Clear all caption clips from T1 (and their captionData) — used before re-transcribing
+  const clearCaptionClips = useCallback((): void => {
+    setClips(prev => {
+      const captionIds = new Set(prev.filter(c => c.trackId === 'T1').map(c => c.id));
+      if (captionIds.size === 0) return prev;
+      setCaptionData(current => {
+        const next = { ...current };
+        captionIds.forEach(id => delete next[id]);
+        return next;
+      });
+      return prev.filter(c => c.trackId !== 'T1');
+    });
+  }, []);
+
   // Update caption style
   const updateCaptionStyle = useCallback((clipId: string, styleUpdates: Partial<CaptionStyle>): void => {
     setCaptionData(prev => {
@@ -721,7 +737,27 @@ export function useProject() {
     return captionData[clipId] || null;
   }, [captionData]);
 
-  // Save project to server (debounced)
+  // Internal save helper (no debounce) — can accept an override clips array for immediate saves
+  const saveProjectNow = useCallback(async (overrideClips?: TimelineClip[]): Promise<void> => {
+    if (!session) return;
+    try {
+      await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/project`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tracks: tracksRef.current,
+          clips: overrideClips ?? clipsRef.current,
+          settings: settingsRef.current,
+          captionData: captionDataRef.current,
+        }),
+      });
+      console.log('[Project] Saved');
+    } catch (error) {
+      console.error('[Project] Save failed:', error);
+    }
+  }, [session]);
+
+  // Save project to server (debounced — for drag/resize operations)
   // Uses refs to always get latest state, avoiding stale closure issues
   const saveProject = useCallback(async (): Promise<void> => {
     if (!session) return;
@@ -732,23 +768,8 @@ export function useProject() {
     }
 
     // Debounce saves - use refs to get latest state values
-    saveTimeoutRef.current = setTimeout(async () => {
-      try {
-        await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/project`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            tracks: tracksRef.current,
-            clips: clipsRef.current,
-            settings: settingsRef.current,
-          }),
-        });
-        console.log('[Project] Saved');
-      } catch (error) {
-        console.error('[Project] Save failed:', error);
-      }
-    }, 500);
-  }, [session]);
+    saveTimeoutRef.current = setTimeout(() => saveProjectNow(), 500);
+  }, [session, saveProjectNow]);
 
   // Load project from server (including assets)
   const loadProject = useCallback(async (): Promise<void> => {
@@ -756,10 +777,11 @@ export function useProject() {
 
     try {
       // Fetch assets first
+      let serverAssets: Asset[] = [];
       const assetsResponse = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/assets`);
       if (assetsResponse.ok) {
         const assetsData = await assetsResponse.json();
-        const serverAssets: Asset[] = (assetsData.assets || []).map((a: {
+        serverAssets = (assetsData.assets || []).map((a: {
           id: string;
           type: 'video' | 'image' | 'audio';
           filename: string;
@@ -794,8 +816,22 @@ export function useProject() {
         const data = await response.json();
         // Don't load tracks from server - always use client's default tracks
         // Server tracks may be outdated (e.g., missing T1, V3, A2)
-        if (data.clips) setClips(data.clips);
+        if (data.clips) {
+          // Repair any clips with duration=0 using the asset's duration
+          // (can happen if getMediaInfo failed during upload for some container formats)
+          const fixedClips = data.clips.map((clip: TimelineClip) => {
+            if ((!clip.duration || clip.duration === 0) && clip.assetId) {
+              const asset = serverAssets.find((a) => a.id === clip.assetId);
+              if (asset?.duration) {
+                return { ...clip, duration: asset.duration, outPoint: asset.duration };
+              }
+            }
+            return clip;
+          });
+          setClips(fixedClips);
+        }
         if (data.settings) setSettings(data.settings);
+        if (data.captionData) setCaptionData(data.captionData);
       }
     } catch (error) {
       console.error('[Project] Load failed:', error);
@@ -819,6 +855,7 @@ export function useProject() {
           tracks: tracksRef.current,
           clips: clipsRef.current,
           settings: settingsRef.current,
+          captionData: captionDataRef.current,
         }),
       });
 
@@ -961,11 +998,13 @@ export function useProject() {
     captionData,
     addCaptionClip,
     addCaptionClipsBatch,
+    clearCaptionClips,
     updateCaptionStyle,
     getCaptionData,
 
     // Project
     saveProject,
+    saveProjectNow,
     loadProject,
     renderProject,
     getDuration,

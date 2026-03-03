@@ -1,6 +1,9 @@
 import http from 'http';
 import { spawn, execSync } from 'child_process';
-import { createWriteStream, createReadStream, unlinkSync, mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync } from 'fs';
+
+// On Windows, npx must be invoked as npx.cmd (spawn doesn't use shell by default)
+const NPX_CMD = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+import { createWriteStream, createReadStream, unlinkSync, mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
@@ -36,6 +39,35 @@ if (process.env.FAL_API_KEY && !process.env.FAL_KEY) {
 const PORT = 3333;
 const TEMP_DIR = join(tmpdir(), 'hyperedit-ffmpeg');
 const SESSIONS_DIR = join(TEMP_DIR, 'sessions');
+
+// Ensure ffmpeg/ffprobe are on PATH — on Windows they may only be installed via WinGet or similar
+// without being added to the system PATH accessible by Node's execSync/spawn.
+{
+  const ffmpegCandidateDirs = [
+    // WinGet full build
+    join(process.env.LOCALAPPDATA || 'C:\\Users\\Default\\AppData\\Local', 'Microsoft', 'WinGet', 'Packages',
+      'Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe', 'ffmpeg-8.0.1-full_build', 'bin'),
+    // WinGet essentials build
+    join(process.env.LOCALAPPDATA || 'C:\\Users\\Default\\AppData\\Local', 'Microsoft', 'WinGet', 'Packages',
+      'Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe', 'ffmpeg-8.0.1-essentials_build', 'bin'),
+    // openclaw toolchain
+    join(process.env.USERPROFILE || 'C:\\Users\\Default', '.openclaw', 'tools', 'ffmpeg',
+      'ffmpeg-8.0.1-essentials_build', 'bin'),
+    join(process.env.USERPROFILE || 'C:\\Users\\Default', '.openclaw', 'tools', 'ffmpeg',
+      'ffmpeg-8.0.1-full_build', 'bin'),
+    // Common manual install locations
+    'C:\\ffmpeg\\bin',
+    join(process.env.ProgramFiles || 'C:\\Program Files', 'ffmpeg', 'bin'),
+  ];
+  const pathSep = process.platform === 'win32' ? ';' : ':';
+  for (const dir of ffmpegCandidateDirs) {
+    if (existsSync(join(dir, 'ffmpeg.exe')) || existsSync(join(dir, 'ffmpeg'))) {
+      process.env.PATH = dir + pathSep + (process.env.PATH || '');
+      console.log(`[Server] FFmpeg found at: ${dir}`);
+      break;
+    }
+  }
+}
 
 // Active video sessions - keeps videos on disk between edits
 const sessions = new Map();
@@ -79,6 +111,7 @@ function restoreSessionsFromDisk() {
       ],
       clips: [],
       settings: { width: 1920, height: 1080, fps: 30 },
+      captionData: {},
     };
 
     if (existsSync(projectPath)) {
@@ -127,6 +160,21 @@ function restoreSessionsFromDisk() {
         // Merge with saved metadata if available
         const savedMeta = savedAssetsMeta[assetId] || {};
 
+        // Re-detect duration if missing or 0 (can happen if getMediaInfo failed on upload)
+        let assetDuration = savedMeta.duration || 0;
+        if (!assetDuration && (type === 'video' || type === 'audio')) {
+          try {
+            const r = execSync(
+              `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${assetPath}"`,
+              { encoding: 'utf-8' }
+            );
+            assetDuration = parseFloat(r.trim()) || 0;
+            if (assetDuration > 0) {
+              console.log(`[Session] Re-detected duration for ${assetFile.name}: ${assetDuration.toFixed(2)}s`);
+            }
+          } catch {}
+        }
+
         assets.set(assetId, {
           id: assetId,
           type: savedMeta.type || type,
@@ -141,7 +189,7 @@ function restoreSessionsFromDisk() {
           sceneCount: savedMeta.sceneCount,
           sceneDataPath: savedMeta.sceneDataPath,
           editCount: savedMeta.editCount || 0,
-          duration: savedMeta.duration,
+          duration: assetDuration,
           width: savedMeta.width,
           height: savedMeta.height,
         });
@@ -270,7 +318,6 @@ function cleanupSession(sessionId) {
   const session = sessions.get(sessionId);
   if (session) {
     try {
-      const { rmSync } = require('fs');
       rmSync(session.dir, { recursive: true, force: true });
       sessions.delete(sessionId);
       console.log(`[Session] Cleaned up: ${sessionId}`);
@@ -811,7 +858,7 @@ async function handleGenerateChapters(req, res) {
     const ai = new GoogleGenAI({ apiKey });
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [
         {
           role: 'user',
@@ -1222,11 +1269,11 @@ async function handleSessionRemoveDeadAir(req, res, sessionId) {
       segmentPaths.push(segmentPath);
 
       const args = [
-        '-y', '-i', videoAsset.path,
-        '-ss', seg.start.toString(),
+        '-y',
+        '-ss', seg.start.toString(), // fast seek BEFORE -i (keyframe-accurate, no full decode)
+        '-i', videoAsset.path,
         '-t', (seg.end - seg.start).toString(),
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
-        '-c:a', 'aac', '-b:a', '192k',
+        '-c', 'copy', // stream copy — no re-encoding needed for silence removal
         segmentPath
       ];
 
@@ -1280,6 +1327,9 @@ async function handleSessionRemoveDeadAir(req, res, sessionId) {
     // Update the video asset metadata
     videoAsset.duration = totalKeptDuration;
     videoAsset.size = newStats.size;
+
+    // Persist updated duration so it survives a server restart
+    saveAssetMetadata(session);
 
     session.editCount++;
 
@@ -1373,7 +1423,7 @@ async function handleSessionChapters(req, res, sessionId) {
 
     const ai = new GoogleGenAI({ apiKey });
     const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{
         role: 'user',
         parts: [
@@ -1541,13 +1591,34 @@ async function getMediaInfo(inputPath) {
     );
     const info = JSON.parse(result);
     const stream = info.streams?.[0] || {};
+    let duration = parseFloat(stream.duration) || 0;
+    // Stream-level duration is absent for some containers (screen recordings, -c copy output, etc.)
+    // Fall back to format-level duration which is always reliable
+    if (!duration) {
+      try {
+        const fmtResult = execSync(
+          `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputPath}"`,
+          { encoding: 'utf-8' }
+        );
+        duration = parseFloat(fmtResult.trim()) || 0;
+      } catch {}
+    }
     return {
       width: stream.width || 0,
       height: stream.height || 0,
-      duration: parseFloat(stream.duration) || 0,
+      duration,
     };
   } catch {
-    return { width: 0, height: 0, duration: 0 };
+    // If stream probe fails entirely, try format-level as last resort
+    try {
+      const fmtResult = execSync(
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputPath}"`,
+        { encoding: 'utf-8' }
+      );
+      return { width: 0, height: 0, duration: parseFloat(fmtResult.trim()) || 0 };
+    } catch {
+      return { width: 0, height: 0, duration: 0 };
+    }
   }
 }
 
@@ -1863,6 +1934,7 @@ function handleProjectGet(req, res, sessionId) {
     tracks: session.project.tracks,
     clips: session.project.clips,
     settings: session.project.settings,
+    captionData: session.project.captionData || {},
   }));
 }
 
@@ -1883,6 +1955,7 @@ async function handleProjectSave(req, res, sessionId) {
     if (data.tracks) session.project.tracks = data.tracks;
     if (data.clips) session.project.clips = data.clips;
     if (data.settings) session.project.settings = { ...session.project.settings, ...data.settings };
+    if (data.captionData) session.project.captionData = data.captionData;
 
     // Save to disk for persistence
     const projectPath = join(session.dir, 'project.json');
@@ -1937,6 +2010,16 @@ async function handleProjectRender(req, res, sessionId) {
     const audioClips = clips
       .filter(c => session.assets.get(c.assetId)?.type === 'audio');
 
+    // DEBUG: log every clip to file so we can diagnose render issues
+    const renderDebugLines = [`=== RENDER DEBUG ${new Date().toISOString()} ===`];
+    renderDebugLines.push(`All clips (${clips.length} total):`);
+    for (const c of clips) {
+      const a = session.assets.get(c.assetId);
+      renderDebugLines.push(`  track=${c.trackId} assetId=${c.assetId || '(empty)'} type=${a?.type || 'NOT FOUND'} aiGenerated=${a?.aiGenerated} start=${c.start} duration=${c.duration} inPoint=${c.inPoint} outPoint=${c.outPoint} path=${a?.path || 'N/A'}`);
+    }
+    renderDebugLines.push(`videoClips after filter: ${videoClips.length}, audioClips: ${audioClips.length}`);
+    console.log(renderDebugLines.join('\n'));
+
     // Calculate total duration from all clips
     const totalDuration = Math.max(
       ...clips.map(c => c.start + c.duration),
@@ -1953,22 +2036,38 @@ async function handleProjectRender(req, res, sessionId) {
     let lastVideo = 'base';
 
     // Process video clips
+    const videoInputIndices = []; // track idx + asset for audio mixing later
     for (const clip of videoClips) {
       const asset = session.assets.get(clip.assetId);
       if (!asset) continue;
 
+      // Images and GIFs need special input flags so they produce frames for the full clip duration
+      if (asset.type === 'image') {
+        const isGif = /\.gif$/i.test(asset.path);
+        if (isGif) {
+          // ignore_loop 0 makes the GIF loop indefinitely instead of playing once
+          inputs.push('-ignore_loop', '0');
+        } else {
+          // loop 1 makes the static image repeat indefinitely
+          inputs.push('-loop', '1');
+        }
+      }
       inputs.push('-i', asset.path);
       const idx = inputIndex++;
+      videoInputIndices.push({ clip, asset, idx });
 
       // Apply trim and scale
       const inPoint = clip.inPoint || 0;
-      const outPoint = clip.outPoint || asset.duration;
+      // For images, asset.duration is 0 — use clip.duration as the out point
+      const outPoint = clip.outPoint || clip.duration || asset.duration;
       const trimDuration = outPoint - inPoint;
 
       let clipFilter = `[${idx}:v]`;
 
-      // Trim
-      clipFilter += `trim=${inPoint}:${outPoint},setpts=PTS-STARTPTS,`;
+      // Trim and shift PTS so overlay frames align with their position on the output timeline.
+      // Without the +(clip.start/TB) shift, frames start at PTS=0 but the overlay is enabled
+      // at t=clip.start, causing FFmpeg to look for frames that don't exist yet.
+      clipFilter += `trim=${inPoint}:${outPoint},setpts=PTS-STARTPTS+(${clip.start}/TB),`;
 
       // Scale/fit to canvas
       clipFilter += `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,`;
@@ -1998,28 +2097,37 @@ async function handleProjectRender(req, res, sessionId) {
     // Rename final output
     filterParts.push(`[${lastVideo}]copy[vout]`);
 
-    // Audio mixing
-    let audioFilter = '';
-    if (audioClips.length > 0) {
-      const audioInputs = [];
-      for (const clip of audioClips) {
-        const asset = session.assets.get(clip.assetId);
-        if (!asset) continue;
+    // Audio mixing — collect audio from:
+    // 1. Video clips on V1/V2/V3 that have embedded audio (skip images & AI animations)
+    // 2. Dedicated audio clips on A1/A2
+    const audioLabels = [];
 
-        inputs.push('-i', asset.path);
-        const idx = inputIndex++;
-        const inPoint = clip.inPoint || 0;
-        const outPoint = clip.outPoint || asset.duration;
+    for (const { clip, asset, idx } of videoInputIndices) {
+      // Only extract audio from real video files (not images, not AI-generated Remotion renders)
+      if (asset.type !== 'video' || asset.aiGenerated) continue;
+      const inPoint = clip.inPoint || 0;
+      const outPoint = clip.outPoint || asset.duration;
+      const delayMs = Math.floor(clip.start * 1000);
+      filterParts.push(`[${idx}:a]atrim=${inPoint}:${outPoint},asetpts=PTS-STARTPTS,adelay=${delayMs}|${delayMs}[va${idx}]`);
+      audioLabels.push(`[va${idx}]`);
+    }
 
-        audioInputs.push(`[${idx}:a]atrim=${inPoint}:${outPoint},asetpts=PTS-STARTPTS,adelay=${Math.floor(clip.start * 1000)}|${Math.floor(clip.start * 1000)}[a${idx}]`);
-      }
+    for (const clip of audioClips) {
+      const asset = session.assets.get(clip.assetId);
+      if (!asset) continue;
+      inputs.push('-i', asset.path);
+      const idx = inputIndex++;
+      const inPoint = clip.inPoint || 0;
+      const outPoint = clip.outPoint || asset.duration;
+      const delayMs = Math.floor(clip.start * 1000);
+      filterParts.push(`[${idx}:a]atrim=${inPoint}:${outPoint},asetpts=PTS-STARTPTS,adelay=${delayMs}|${delayMs}[aa${idx}]`);
+      audioLabels.push(`[aa${idx}]`);
+    }
 
-      if (audioInputs.length > 0) {
-        filterParts.push(...audioInputs);
-        const audioMix = audioInputs.map((_, i) => `[a${clips.indexOf(audioClips[i]) + videoClips.length}]`).join('');
-        filterParts.push(`${audioMix}amix=inputs=${audioInputs.length}[aout]`);
-        audioFilter = '-map [aout]';
-      }
+    if (audioLabels.length === 1) {
+      filterParts.push(`${audioLabels[0]}acopy[aout]`);
+    } else if (audioLabels.length > 1) {
+      filterParts.push(`${audioLabels.join('')}amix=inputs=${audioLabels.length}:normalize=0[aout]`);
     }
 
     // Build final command
@@ -2032,7 +2140,7 @@ async function handleProjectRender(req, res, sessionId) {
       '-map', '[vout]',
     ];
 
-    if (audioFilter) {
+    if (audioLabels.length > 0) {
       ffmpegArgs.push('-map', '[aout]');
     }
 
@@ -2048,7 +2156,11 @@ async function handleProjectRender(req, res, sessionId) {
     ffmpegArgs.push('-t', totalDuration.toString());
     ffmpegArgs.push(outputPath);
 
-    console.log(`[${sessionId}] FFmpeg render command prepared`);
+    renderDebugLines.push(`\nFFmpeg command:\nffmpeg ${ffmpegArgs.join(' ')}`);
+    const renderLogPath = join(session.dir, 'render-debug.log');
+    writeFileSync(renderLogPath, renderDebugLines.join('\n'));
+    console.log(`[${sessionId}] FFmpeg render command prepared — debug log: ${renderLogPath}`);
+    console.log(`[${sessionId}] Full ffmpeg args: ffmpeg ${ffmpegArgs.join(' ')}`);
 
     await runFFmpeg(ffmpegArgs, sessionId);
 
@@ -2084,7 +2196,6 @@ async function handleRenderDownload(req, res, sessionId, renderType) {
   }
 
   // Find the render file
-  const { readdirSync } = require('fs');
   const files = readdirSync(session.rendersDir);
 
   let renderFile;
@@ -2384,10 +2495,8 @@ async function transcribeVideo(videoPath, jobId) {
     // Send to Whisper API
     console.log(`[${jobId}] Sending to Whisper API...`);
     const audioBuffer = readFileSync(audioPath);
-    const audioBlob = new Blob([audioBuffer], { type: 'audio/mp3' });
-
-    const formData = new FormData();
-    formData.append('file', audioBlob, 'audio.mp3');
+    const formData = new globalThis.FormData();
+    formData.append('file', new globalThis.Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
     formData.append('model', 'whisper-1');
     formData.append('response_format', 'verbose_json');
     formData.append('timestamp_granularities[]', 'word');
@@ -2656,10 +2765,20 @@ async function handleGiphyAdd(req, res, sessionId) {
 }
 
 // Handle simple transcription for captions using Gemini (returns word-level timestamps)
+// Detect the correct Python binary (python3 on Linux/Mac, python on Windows)
+async function getPythonBinary() {
+  return new Promise((resolve) => {
+    const check = spawn('python3', ['-c', 'print("ok")']);
+    check.on('close', (code) => { if (code === 0) resolve('python3'); else resolve('python'); });
+    check.on('error', () => resolve('python'));
+  });
+}
+
 // Check if local Whisper is available
 async function checkLocalWhisper() {
+  const py = await getPythonBinary();
   return new Promise((resolve) => {
-    const check = spawn('python3', ['-c', 'import whisper; print("ok")']);
+    const check = spawn(py, ['-c', 'import whisper; print("ok")']);
     let output = '';
     check.stdout.on('data', (data) => { output += data.toString(); });
     check.on('close', (code) => {
@@ -2672,10 +2791,11 @@ async function checkLocalWhisper() {
 // Run local Whisper transcription
 async function runLocalWhisper(audioPath, jobId) {
   const scriptPath = join(process.cwd(), 'scripts', 'whisper-transcribe.py');
+  const py = await getPythonBinary();
 
   return new Promise((resolve, reject) => {
     console.log(`[${jobId}] Running local Whisper...`);
-    const whisperProcess = spawn('python3', [scriptPath, audioPath, 'base']);
+    const whisperProcess = spawn(py, [scriptPath, audioPath, 'base']);
 
     let stdout = '';
     let stderr = '';
@@ -2759,7 +2879,7 @@ async function getOrTranscribeVideo(session, videoAsset, jobId) {
     const audioBase64 = audioBuffer.toString('base64');
 
     const result = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{
         role: 'user',
         parts: [
@@ -2789,13 +2909,13 @@ async function getOrTranscribeVideo(session, videoAsset, jobId) {
     }
   } else if (openaiKey) {
     console.log(`[${jobId}] Using OpenAI Whisper API...`);
-    const { FormData, File } = await import('formdata-node');
     const audioBuffer = readFileSync(audioPath);
-    const formData = new FormData();
-    formData.append('file', new File([audioBuffer], 'audio.mp3', { type: 'audio/mp3' }));
+    const formData = new globalThis.FormData();
+    formData.append('file', new globalThis.Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
     formData.append('model', 'whisper-1');
     formData.append('response_format', 'verbose_json');
     formData.append('timestamp_granularities[]', 'word');
+    formData.append('language', 'en');
 
     const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
       method: 'POST',
@@ -2951,23 +3071,7 @@ async function handleTranscribe(req, res, sessionId) {
     for await (const chunk of req) {
       body += chunk;
     }
-    const { assetId } = JSON.parse(body || '{}');
-
-    // Determine which method to use
-    const useLocalWhisper = hasLocalWhisper;
-    const useOpenAIWhisper = !hasLocalWhisper && !!openaiKey;
-    const useGemini = !hasLocalWhisper && !openaiKey && !!geminiKey;
-
-    const method = useLocalWhisper ? 'Local Whisper' : useOpenAIWhisper ? 'OpenAI Whisper' : 'Gemini';
-    console.log(`\n[${jobId}] === TRANSCRIBE FOR CAPTIONS (${method}) ===`);
-
-    if (useLocalWhisper) {
-      console.log(`[${jobId}] Using local Whisper for accurate word-level timestamps (free)`);
-    } else if (useOpenAIWhisper) {
-      console.log(`[${jobId}] Using OpenAI Whisper API for accurate word-level timestamps`);
-    } else {
-      console.log(`[${jobId}] Using Gemini (timestamps may drift - install local Whisper for accurate sync)`);
-    }
+    const { assetId, inPoint: inPointRaw, outPoint: outPointRaw } = JSON.parse(body || '{}');
 
     // Find the video asset
     let videoAsset = null;
@@ -3004,14 +3108,52 @@ async function handleTranscribe(req, res, sessionId) {
     const totalDuration = await getVideoDuration(videoAsset.path);
     console.log(`[${jobId}] Video duration: ${totalDuration.toFixed(2)}s`);
 
-    // Extract audio as MP3
+    // Resolve inPoint/outPoint.
+    // Priority: 1) client-sent values  2) saved project V1 clip  3) in-memory asset duration
+    // Do NOT use totalDuration (ffprobe) — container metadata can be stale after -c copy concat.
+    const savedV1Clip = (session.project.clips || []).find(c => c.trackId === 'V1');
+    const projectInPoint = savedV1Clip ? (savedV1Clip.inPoint ?? 0) : 0;
+    // Compute outPoint from inPoint+duration (more reliable than reading outPoint directly)
+    const projectOutPoint = savedV1Clip
+      ? (savedV1Clip.inPoint ?? 0) + savedV1Clip.duration
+      : (videoAsset.duration || totalDuration);
+
+    const inPoint = typeof inPointRaw === 'number' ? inPointRaw : projectInPoint;
+    const outPoint = typeof outPointRaw === 'number' ? outPointRaw : projectOutPoint;
+    const segmentDuration = Math.max(outPoint - inPoint, 0.1);
+    console.log(`[${jobId}] Transcribing segment [${inPoint.toFixed(2)}s – ${outPoint.toFixed(2)}s] = ${segmentDuration.toFixed(2)}s (file reports ${totalDuration.toFixed(2)}s, project clip duration=${savedV1Clip?.duration ?? 'N/A'})`);
+
+    // Determine which method to use.
+    // Local Whisper on CPU is impractical for videos > 2 minutes — prefer Gemini for long videos.
+    const LOCAL_WHISPER_MAX_SECONDS = 120;
+    const tooLongForLocalWhisper = segmentDuration > LOCAL_WHISPER_MAX_SECONDS;
+    const useLocalWhisper = hasLocalWhisper && !tooLongForLocalWhisper;
+    const useOpenAIWhisper = !useLocalWhisper && !!openaiKey;
+    const useGemini = !useLocalWhisper && !openaiKey && !!geminiKey;
+
+    const method = useLocalWhisper ? 'Local Whisper' : useOpenAIWhisper ? 'OpenAI Whisper' : 'Gemini';
+    console.log(`\n[${jobId}] === TRANSCRIBE FOR CAPTIONS (${method}) ===`);
+
+    if (useLocalWhisper) {
+      console.log(`[${jobId}] Using local Whisper for accurate word-level timestamps (free)`);
+    } else if (tooLongForLocalWhisper && hasLocalWhisper && !openaiKey) {
+      console.log(`[${jobId}] Video is ${totalDuration.toFixed(0)}s — too long for local Whisper on CPU. Using Gemini instead.`);
+    } else if (useOpenAIWhisper) {
+      console.log(`[${jobId}] Using OpenAI Whisper API for accurate word-level timestamps`);
+    } else {
+      console.log(`[${jobId}] Using Gemini (timestamps may drift - install local Whisper for accurate sync)`);
+    }
+
+    // Extract audio as MP3 (only the segment that's actually on V1)
+    // Always apply -ss and -t — this correctly handles both:
+    //   • files where the container duration metadata is stale/wrong (e.g. after -c copy concat)
+    //   • files where the clip only shows a trimmed portion of a longer asset
     console.log(`[${jobId}] Extracting audio...`);
-    await runFFmpeg([
-      '-y', '-i', videoAsset.path,
-      '-vn', '-acodec', 'libmp3lame',
-      '-ab', '64k', '-ar', '16000', '-ac', '1',
-      audioPath
-    ], jobId);
+    const extractArgs = ['-y'];
+    if (inPoint > 0) extractArgs.push('-ss', inPoint.toString());
+    extractArgs.push('-i', videoAsset.path, '-t', segmentDuration.toString());
+    extractArgs.push('-vn', '-acodec', 'libmp3lame', '-ab', '64k', '-ar', '16000', '-ac', '1', audioPath);
+    await runFFmpeg(extractArgs, jobId);
 
     const { stat } = await import('fs/promises');
     const audioStats = await stat(audioPath);
@@ -3035,10 +3177,10 @@ async function handleTranscribe(req, res, sessionId) {
           const ai = new GoogleGenAI({ apiKey: geminiKey });
 
           const response = await ai.models.generateContent({
-            model: 'gemini-2.0-flash',
+            model: 'gemini-2.5-flash',
             contents: [{ role: 'user', parts: [
               { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
-              { text: `Transcribe this audio with word-level timestamps. Duration: ${totalDuration.toFixed(1)}s. Return JSON: {"text": "full text", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
+              { text: `Transcribe this audio with word-level timestamps. Duration: ${segmentDuration.toFixed(1)}s. Return JSON: {"text": "full text", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
             ]}]
           });
 
@@ -3059,15 +3201,13 @@ async function handleTranscribe(req, res, sessionId) {
       console.log(`[${jobId}] Sending to OpenAI Whisper for transcription...`);
       const audioBuffer = readFileSync(audioPath);
 
-      // Create FormData for multipart upload
-      const FormData = (await import('formdata-node')).FormData;
-      const { Blob } = await import('buffer');
-
-      const formData = new FormData();
-      formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
+      // Create FormData for multipart upload (use native globals for Node 18+ fetch compatibility)
+      const formData = new globalThis.FormData();
+      formData.append('file', new globalThis.Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
       formData.append('model', 'whisper-1');
       formData.append('response_format', 'verbose_json');
       formData.append('timestamp_granularities[]', 'word');
+      formData.append('language', 'en');
 
       const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
         method: 'POST',
@@ -3104,7 +3244,7 @@ async function handleTranscribe(req, res, sessionId) {
       const ai = new GoogleGenAI({ apiKey: geminiKey });
 
       const response = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [
           {
             role: 'user',
@@ -3116,7 +3256,7 @@ async function handleTranscribe(req, res, sessionId) {
                 }
               },
               {
-                text: `Transcribe this audio with word-level timestamps. The audio is ${totalDuration.toFixed(1)} seconds long.
+                text: `Transcribe this audio with word-level timestamps. The audio is ${segmentDuration.toFixed(1)} seconds long.
 
 IMPORTANT: Return ONLY valid JSON, no markdown, no explanation. The response must be parseable JSON.
 
@@ -3342,7 +3482,7 @@ async function analyzeBrollOpportunities(transcript, words, totalDuration, apiKe
   const ai = new GoogleGenAI({ apiKey });
 
   const response = await ai.models.generateContent({
-    model: 'gemini-2.0-flash',
+    model: 'gemini-2.5-flash',
     contents: [{
       role: 'user',
       parts: [{
@@ -3527,7 +3667,7 @@ async function handleGenerateBroll(req, res, sessionId) {
         const audioBase64 = audioBuffer.toString('base64');
         const ai = new GoogleGenAI({ apiKey });
         const response = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
+          model: 'gemini-2.5-flash',
           contents: [{ role: 'user', parts: [
             { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
             { text: `Transcribe this audio with word timestamps. Duration: ${totalDuration}s. Return JSON: {"text": "...", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
@@ -3544,11 +3684,8 @@ async function handleGenerateBroll(req, res, sessionId) {
     } else if (openaiKey) {
       console.log(`[${jobId}]    Using OpenAI Whisper API...`);
       const audioBuffer = readFileSync(audioPath);
-      const FormData = (await import('formdata-node')).FormData;
-      const { Blob } = await import('buffer');
-
-      const formData = new FormData();
-      formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
+      const formData = new globalThis.FormData();
+      formData.append('file', new globalThis.Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
       formData.append('model', 'whisper-1');
       formData.append('response_format', 'verbose_json');
       formData.append('timestamp_granularities[]', 'word');
@@ -3580,7 +3717,7 @@ async function handleGenerateBroll(req, res, sessionId) {
 
       const ai = new GoogleGenAI({ apiKey });
       const response = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [{
           role: 'user',
           parts: [
@@ -3869,7 +4006,7 @@ async function handleGenerateAnimation(req, res, sessionId) {
 
               const ai = new GoogleGenAI({ apiKey });
               const segmentResult = await ai.models.generateContent({
-                model: 'gemini-2.0-flash',
+                model: 'gemini-2.5-flash',
                 contents: [{
                   role: 'user',
                   parts: [{
@@ -4179,7 +4316,7 @@ ${attachedAssetIds?.length ? `- IMPORTANT: Include media scenes to showcase the 
 - For videos, consider using slow-mo (videoPlaybackRate: 0.5) for dramatic moments` : ''}`;
 
     const result = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
     });
 
@@ -4413,9 +4550,10 @@ ${attachedAssetIds?.length ? `- IMPORTANT: Include media scenes to showcase the 
     ];
 
     await new Promise((resolve, reject) => {
-      const proc = spawn('npx', remotionArgs, {
+      const proc = spawn(NPX_CMD, remotionArgs, {
         cwd: process.cwd(),
         stdio: ['pipe', 'pipe', 'pipe'],
+        shell: process.platform === 'win32',
       });
 
       let stderr = '';
@@ -4831,9 +4969,10 @@ Return ONLY the complete JSON structure with your minimal change applied. No mar
     ];
 
     await new Promise((resolve, reject) => {
-      const proc = spawn('npx', remotionArgs, {
+      const proc = spawn(NPX_CMD, remotionArgs, {
         cwd: process.cwd(),
         stdio: ['pipe', 'pipe', 'pipe'],
+        shell: process.platform === 'win32',
       });
 
       let stderr = '';
@@ -4998,7 +5137,7 @@ User: "a peaceful forest"
 Enhanced: "Ancient moss-covered forest with towering redwood trees, ethereal morning mist weaving between massive trunks, soft dappled sunlight filtering through the dense canopy, ferns and wildflowers carpeting the forest floor, a gentle stream with crystal-clear water, mystical and serene atmosphere, nature photography style, rich greens and earth tones, depth and scale, photorealistic, National Geographic quality"`;
 
         const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
+          model: 'gemini-2.5-flash',
           contents: [{
             role: 'user',
             parts: [{ text: `Enhance this image prompt:\n\n"${prompt}"` }]
@@ -5204,7 +5343,7 @@ Input: "zoom out"
 Output: "Epic reveal shot with slow cinematic zoom out, camera gently pulling back to reveal the full scene, subtle atmospheric haze and soft light flares, smooth dolly movement with slight vertical lift"`;
 
         const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
+          model: 'gemini-2.5-flash',
           contents: [
             { role: 'user', parts: [{ text: systemPrompt }] },
             { role: 'user', parts: [{ text: `Enhance this video motion prompt: "${prompt}"` }] }
@@ -5409,7 +5548,7 @@ async function handleRestyleVideo(req, res, sessionId) {
         const ai = new GoogleGenAI({ apiKey: geminiApiKey });
 
         const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
+          model: 'gemini-2.5-flash',
           contents: [{
             role: 'user',
             parts: [{
@@ -5821,7 +5960,7 @@ async function handleGenerateBatchAnimations(req, res, sessionId) {
 
     const ai = new GoogleGenAI({ apiKey });
     const planResult = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{
         role: 'user',
         parts: [{
@@ -5895,7 +6034,7 @@ Guidelines:
 
       // Generate scene data with Gemini
       const sceneResult = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [{
           role: 'user',
           parts: [{
@@ -5987,9 +6126,10 @@ Make it visually engaging with good color choices. Use 2-4 scenes for variety.`
       ];
 
       await new Promise((resolve, reject) => {
-        const proc = spawn('npx', remotionArgs, {
+        const proc = spawn(NPX_CMD, remotionArgs, {
           cwd: process.cwd(),
           stdio: ['pipe', 'pipe', 'pipe'],
+          shell: process.platform === 'win32',
         });
 
         let stderr = '';
@@ -6181,7 +6321,7 @@ async function handleAnalyzeForAnimation(req, res, sessionId) {
       const audioBase64 = audioBuffer.toString('base64');
 
       const result = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [{
           role: 'user',
           parts: [
@@ -6197,47 +6337,11 @@ async function handleAnalyzeForAnimation(req, res, sessionId) {
       };
     };
 
-    if (hasLocalWhisper) {
-      try {
-        console.log(`[${jobId}]    Using local Whisper...`);
-        transcription = await runLocalWhisper(audioPath, jobId);
-      } catch (whisperError) {
-        console.log(`[${jobId}]    Local Whisper failed: ${whisperError.message}`);
-        console.log(`[${jobId}]    Falling back to Gemini...`);
-        transcription = await transcribeWithGemini();
-      }
-    } else if (openaiKey) {
-      console.log(`[${jobId}]    Using OpenAI Whisper API...`);
-      const FormData = (await import('node-fetch')).default.FormData || global.FormData;
-      const formData = new FormData();
-      formData.append('file', createReadStream(audioPath));
-      formData.append('model', 'whisper-1');
-      formData.append('response_format', 'verbose_json');
-      formData.append('timestamp_granularities[]', 'word');
-
-      const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${openaiKey}` },
-        body: formData,
-      });
-
-      if (!whisperResponse.ok) {
-        throw new Error(`Whisper API error: ${whisperResponse.status}`);
-      }
-
-      const whisperResult = await whisperResponse.json();
-      transcription = {
-        text: whisperResult.text || '',
-        words: (whisperResult.words || []).map(w => ({
-          text: w.word,
-          start: w.start,
-          end: w.end,
-        })),
-      };
-    } else {
-      // Use Gemini as fallback
-      transcription = await transcribeWithGemini();
-    }
+    // Local Whisper on CPU is too slow for long audio — use Gemini for segments > 2 minutes
+    // For animation analysis, always use Gemini for transcription — local Whisper is
+    // too slow on CPU and produces unreliable output for short segments.
+    console.log(`[${jobId}]    Using Gemini for transcription (fast, reliable for animation analysis)...`);
+    transcription = await transcribeWithGemini();
 
     console.log(`[${jobId}] Transcription complete: ${transcription.text.substring(0, 100)}...`);
 
@@ -6282,6 +6386,12 @@ The highlight should:
       ? `\nNOTE: This transcript is from a SPECIFIC SEGMENT of the video (${segmentStart.toFixed(1)}s - ${endTime.toFixed(1)}s, duration: ${segmentDuration.toFixed(1)}s). Create an animation that relates ONLY to what is being discussed in this segment, not the entire video.`
       : '';
 
+    // Keep full type guidance but append duration override when time range is set
+    const baseTypePrompt = typePrompts[type] || typePrompts.intro;
+    const durationGuidance = hasTimeRange
+      ? `${baseTypePrompt}\n\nDURATION OVERRIDE: Ignore the duration guideline above. The animation must be EXACTLY ${segmentDuration.toFixed(1)} seconds (${Math.round(segmentDuration * 30)} total frames at 30fps). Create enough scenes to fill this full duration.`
+      : baseTypePrompt;
+
     const scenePrompt = `You are a motion graphics designer. Analyze this video transcript and create a contextual ${type} animation concept.
 
 VIDEO TRANSCRIPT:
@@ -6290,7 +6400,7 @@ ${timeContext}
 
 ${description ? `USER HINT: "${description}"` : ''}
 
-${typePrompts[type] || typePrompts.intro}
+${durationGuidance}
 
 Based on the video content above, return ONLY valid JSON (no markdown) with this structure:
 {
@@ -6330,20 +6440,18 @@ Use specific terms, concepts, and themes from the transcript.
 Feel free to add a GIF scene for reactions or emphasis when appropriate!`;
 
     const sceneResult = await genAI.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{ role: 'user', parts: [{ text: scenePrompt }] }],
+      config: { responseMimeType: 'application/json' },
     });
 
     let sceneData;
     try {
       const responseText = sceneResult.candidates[0].content.parts[0].text;
-      const cleanedResponse = responseText
-        .replace(/```json\n?/g, '')
-        .replace(/```\n?/g, '')
-        .trim();
-      sceneData = JSON.parse(cleanedResponse);
+      sceneData = JSON.parse(responseText);
     } catch (parseError) {
-      console.error(`[${jobId}] Failed to parse Gemini response:`, parseError);
+      const rawText = sceneResult.candidates?.[0]?.content?.parts?.[0]?.text || '(no response)';
+      console.error(`[${jobId}] Failed to parse Gemini response. Raw (first 500 chars):`, rawText.substring(0, 500));
       throw new Error('Failed to parse AI-generated scene data');
     }
 
@@ -6385,6 +6493,20 @@ Feel free to add a GIF scene for reactions or emphasis when appropriate!`;
           }
         }
       }
+    }
+
+    // Enforce exact duration when user specified a time range
+    if (hasTimeRange) {
+      const targetFrames = Math.round(segmentDuration * 30);
+      const actualFrames = sceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
+      if (Math.abs(actualFrames - targetFrames) > 3) {
+        const scale = targetFrames / actualFrames;
+        console.log(`[${jobId}] ⏱️ Scaling scenes from ${(actualFrames/30).toFixed(1)}s to ${segmentDuration.toFixed(1)}s (scale: ${scale.toFixed(2)}x)`);
+        sceneData.scenes.forEach(scene => {
+          scene.duration = Math.max(15, Math.round(scene.duration * scale));
+        });
+      }
+      sceneData.totalDuration = sceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
     }
 
     const animationTotalDuration = sceneData.totalDuration || sceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
@@ -6533,9 +6655,10 @@ async function handleRenderFromConcept(req, res, sessionId) {
     console.log(`[${jobId}] Remotion command: npx ${remotionArgs.join(' ')}`);
 
     await new Promise((resolve, reject) => {
-      const proc = spawn('npx', remotionArgs, {
+      const proc = spawn(NPX_CMD, remotionArgs, {
         cwd: process.cwd(),
         stdio: ['pipe', 'pipe', 'pipe'],
+        shell: process.platform === 'win32',
       });
 
       let stdout = '';
@@ -6688,7 +6811,7 @@ async function handleGenerateTranscriptAnimation(req, res, sessionId) {
       const audioBase64 = audioBuffer.toString('base64');
       const ai = new GoogleGenAI({ apiKey });
       const geminiResponse = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [{ role: 'user', parts: [
           { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
           { text: `Transcribe this audio with word timestamps. Duration: ${totalDuration}s. Return JSON: {"text": "...", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
@@ -6716,11 +6839,8 @@ async function handleGenerateTranscriptAnimation(req, res, sessionId) {
     } else if (openaiKey) {
       console.log(`[${jobId}]    Using OpenAI Whisper API...`);
       const audioBuffer = readFileSync(audioPath);
-      const FormData = (await import('formdata-node')).FormData;
-      const { Blob } = await import('buffer');
-
-      const formData = new FormData();
-      formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
+      const formData = new globalThis.FormData();
+      formData.append('file', new globalThis.Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
       formData.append('model', 'whisper-1');
       formData.append('response_format', 'verbose_json');
       formData.append('timestamp_granularities[]', 'word');
@@ -6783,7 +6903,7 @@ Return JSON array of phrases to animate:
 Pick phrases that are spread throughout the video. Each phrase should be 2-6 words.`;
 
     const analysisResponse = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{ role: 'user', parts: [{ text: analysisPrompt }] }]
     });
 
@@ -6891,9 +7011,10 @@ Pick phrases that are spread throughout the video. Each phrase should be 2-6 wor
     console.log(`[${jobId}] Remotion command: npx ${remotionArgs.join(' ')}`);
 
     await new Promise((resolve, reject) => {
-      const proc = spawn('npx', remotionArgs, {
+      const proc = spawn(NPX_CMD, remotionArgs, {
         cwd: process.cwd(),
         stdio: ['pipe', 'pipe', 'pipe'],
+        shell: process.platform === 'win32',
       });
 
       proc.stdout.on('data', (data) => {
@@ -7054,7 +7175,7 @@ async function handleGenerateContextualAnimation(req, res, sessionId) {
       const audioBase64 = audioBuffer.toString('base64');
 
       const result = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [{
           role: 'user',
           parts: [
@@ -7081,9 +7202,9 @@ async function handleGenerateContextualAnimation(req, res, sessionId) {
       }
     } else if (openaiKey) {
       console.log(`[${jobId}]    Using OpenAI Whisper API...`);
-      const FormData = (await import('node-fetch')).default.FormData || global.FormData;
-      const formData = new FormData();
-      formData.append('file', createReadStream(audioPath));
+      const audioBuffer = readFileSync(audioPath);
+      const formData = new globalThis.FormData();
+      formData.append('file', new globalThis.Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
       formData.append('model', 'whisper-1');
       formData.append('response_format', 'verbose_json');
       formData.append('timestamp_granularities[]', 'word');
@@ -7184,7 +7305,7 @@ IMPORTANT: The animation content should directly relate to the video's actual to
 Use specific terms, concepts, and themes from the transcript.`;
 
     const sceneResult = await genAI.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{ role: 'user', parts: [{ text: scenePrompt }] }],
     });
 
@@ -7241,9 +7362,10 @@ Use specific terms, concepts, and themes from the transcript.`;
     ];
 
     await new Promise((resolve, reject) => {
-      const proc = spawn('npx', remotionArgs, {
+      const proc = spawn(NPX_CMD, remotionArgs, {
         cwd: process.cwd(),
         stdio: ['pipe', 'pipe', 'pipe'],
+        shell: process.platform === 'win32',
       });
 
       let stdout = '';
@@ -7536,20 +7658,42 @@ async function handleProcessAsset(req, res, sessionId) {
     console.log(`[${jobId}] Source: ${asset.filename}`);
     console.log(`[${jobId}] Command: ${command}`);
 
-    // Parse the FFmpeg command and replace input/output placeholders
-    // Expected format: "ffmpeg -i input.mp4 [options] output.mp4"
-    // We'll replace input.mp4 with actual path and output.mp4 with new path
-    let ffmpegArgs = command
-      .replace(/^ffmpeg\s+/, '') // Remove 'ffmpeg' prefix
-      .replace(/input\.mp4|"input\.mp4"/gi, `"${asset.path}"`)
-      .replace(/output\.mp4|"output\.mp4"/gi, `"${outputPath}"`)
-      .split(/\s+/)
-      .filter(arg => arg.length > 0);
+    // Parse the FFmpeg command and replace input/output placeholders.
+    // Use a shell-aware tokenizer so quoted filter strings (e.g. "afftdn=nf=-25")
+    // are kept as single args, and paths are inserted WITHOUT extra quotes
+    // (spawn takes an args array, not a shell string — no quoting needed).
+    const tokenizeCommand = (cmd) => {
+      const tokens = [];
+      let cur = '';
+      let inQuote = false;
+      let quoteChar = '';
+      for (const ch of cmd) {
+        if (inQuote) {
+          if (ch === quoteChar) { inQuote = false; }
+          else { cur += ch; }
+        } else if (ch === '"' || ch === "'") {
+          inQuote = true; quoteChar = ch;
+        } else if (ch === ' ' || ch === '\t') {
+          if (cur.length) { tokens.push(cur); cur = ''; }
+        } else {
+          cur += ch;
+        }
+      }
+      if (cur.length) tokens.push(cur);
+      return tokens;
+    };
 
-    // If the command doesn't have proper input/output, construct a basic one
-    if (!ffmpegArgs.some(arg => arg.includes(asset.path))) {
-      // Reconstruct with proper input
-      ffmpegArgs = ['-y', '-i', asset.path, ...ffmpegArgs.filter(a => a !== '-i'), outputPath];
+    const rawCommand = command.replace(/^ffmpeg\s+/i, '');
+    let ffmpegArgs = tokenizeCommand(rawCommand)
+      .map(arg => {
+        if (/^"?input\.mp4"?$/i.test(arg)) return asset.path;
+        if (/^"?output\.mp4"?$/i.test(arg)) return outputPath;
+        return arg;
+      });
+
+    // If the command doesn't reference the actual asset path, reconstruct it
+    if (!ffmpegArgs.some(arg => arg === asset.path)) {
+      ffmpegArgs = ['-i', asset.path, ...ffmpegArgs.filter(a => a !== '-i'), outputPath];
     }
 
     // Ensure -y flag for overwrite

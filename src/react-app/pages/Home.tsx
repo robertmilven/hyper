@@ -59,11 +59,13 @@ export default function Home() {
     moveClip,
     splitClip,
     saveProject,
+    saveProjectNow,
     loadProject,
     renderProject,
     getDuration,
     // Captions
     addCaptionClipsBatch,
+    clearCaptionClips,
     updateCaptionStyle,
     getCaptionData,
     // Timeline tabs
@@ -768,9 +770,11 @@ export default function Home() {
     const data = await response.json();
     console.log('Transcription result:', data);
 
+    // Refresh assets first so the new GIF assets appear in the library and preview
+    await refreshAssets();
+
     // Add each GIF to the timeline at its timestamp on the V2 (overlay) track
     for (const gifInfo of data.gifAssets) {
-      // Add clip to V2 track at the keyword's timestamp
       addClip(gifInfo.assetId, 'V2', gifInfo.timestamp, 3); // 3 second duration for GIFs
     }
 
@@ -778,7 +782,7 @@ export default function Home() {
     await saveProject();
 
     return data;
-  }, [session, assets, addClip, saveProject]);
+  }, [session, assets, addClip, saveProject, refreshAssets]);
 
   // Handle generating B-roll images and adding to timeline
   const handleGenerateBroll = useCallback(async () => {
@@ -920,15 +924,21 @@ export default function Home() {
         }
         console.log(`[DeadAir] Updating clip ${v1Clip.id}: duration ${v1Clip.duration} -> ${result.duration}`);
         updateClip(v1Clip.id, updates);
+
+        // Immediately save with the corrected clips — don't rely on debounced saveProject
+        // (React state update from updateClip may not have propagated to clipsRef yet)
+        const updatedClips = clips.map(c => c.id === v1Clip.id ? { ...c, ...updates } : c);
+        await saveProjectNow(updatedClips);
+      } else {
+        await saveProject();
       }
-      await saveProject();
     }
 
     return {
       duration: result.duration,
       removedDuration: result.removedDuration,
     };
-  }, [session, assets, clips, refreshAssets, updateClip, saveProject]);
+  }, [session, assets, clips, refreshAssets, updateClip, saveProject, saveProjectNow]);
 
   // Handle transcribing video and adding captions
   const handleTranscribeAndAddCaptions = useCallback(async (options?: { highlightColor?: string; fontFamily?: string }) => {
@@ -936,18 +946,31 @@ export default function Home() {
       throw new Error('No session available');
     }
 
-    // Find the original (non-AI-generated) video asset to transcribe
-    const videoAsset = assets.find(a => a.type === 'video' && !a.aiGenerated) || assets.find(a => a.type === 'video');
+    // Use the V1 clip's asset and in/out points so we only transcribe what's actually on the timeline
+    const v1Clip = clips.find(c => c.trackId === 'V1');
+    let videoAsset = v1Clip ? assets.find(a => a.id === v1Clip.assetId) : undefined;
+    // Fallback to any non-AI video if V1 clip not found or asset missing
+    if (!videoAsset) {
+      videoAsset = assets.find(a => a.type === 'video' && !a.aiGenerated) || assets.find(a => a.type === 'video');
+    }
+    const inPoint = v1Clip?.inPoint ?? 0;
+    // Compute outPoint from inPoint + duration — more reliable than reading outPoint directly,
+    // which can be missing or stale in old saved clips. duration is always correct (it drives the timeline).
+    const outPoint = inPoint + (v1Clip?.duration ?? videoAsset?.duration ?? 0);
+    const clipStart = v1Clip?.start ?? 0;
 
     if (!videoAsset || videoAsset.type !== 'video') {
       throw new Error('Please upload a video first');
     }
 
-    // Call the transcribe endpoint
+    // Clear any existing captions on T1 before adding new ones — prevents stale captions accumulating
+    clearCaptionClips();
+
+    // Call the transcribe endpoint — pass inPoint/outPoint so server only extracts the visible portion
     const response = await fetch(`http://localhost:3333/session/${session.sessionId}/transcribe`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ assetId: videoAsset.id }),
+      body: JSON.stringify({ assetId: videoAsset.id, inPoint, outPoint }),
     });
 
     if (!response.ok) {
@@ -1010,7 +1033,9 @@ export default function Home() {
         }));
         return {
           words: relativeWords,
-          start: chunk.start,
+          // Word timestamps are relative to inPoint (start of extracted audio).
+          // Add clipStart so captions align with where the clip sits on the timeline.
+          start: chunk.start + clipStart,
           duration,
           style: {
             ...(options?.highlightColor && { highlightColor: options.highlightColor }),
@@ -1027,7 +1052,7 @@ export default function Home() {
     }
 
     return data;
-  }, [session, assets, addCaptionClipsBatch, saveProject]);
+  }, [session, assets, clips, clearCaptionClips, addCaptionClipsBatch, saveProject]);
 
   // Handle updating caption style
   const handleUpdateCaptionStyle = useCallback((clipId: string, styleUpdates: Partial<CaptionStyle>) => {
