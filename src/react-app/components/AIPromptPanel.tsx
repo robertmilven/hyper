@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
-import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move, Star, Globe } from 'lucide-react';
+import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move, Star, Globe, ZoomIn, Maximize2, RotateCcw, Waves, Sun, Palette, Layers, Camera, Aperture, Sliders } from 'lucide-react';
 import type { TimelineClip, Track, Asset, CaptionData, CaptionWord } from '@/react-app/hooks/useProject';
 import { MOTION_TEMPLATES, type TemplateId } from '@/remotion/templates';
 import MotionGraphicsPanel from './MotionGraphicsPanel';
@@ -881,19 +881,71 @@ export default function AIPromptPanel({
     },
   ];
 
-  const suggestions = [
-    { icon: Type, text: 'Add captions' },
-    { icon: VolumeX, text: 'Remove dead air / silence' },
-    { icon: Wand2, text: 'Remove background noise' },
-    { icon: Clock, text: 'Speed up by 1.5x' },
-    { icon: FileVideo, text: 'Add GIF animations' },
-    { icon: Image, text: 'Add B-roll images' },
-    { icon: Scissors, text: 'Cut at chapters' },
-    { icon: Sparkles, text: 'Create demo animation' },
-    { icon: Zap, text: 'Animate transcript' },
-    { icon: Film, text: 'Add 5 animations' },
-    { icon: Move, text: 'Add Ken Burns zoom effect' },
-    { icon: Music, text: 'Extract audio to A1' },
+  const suggestionGroups = [
+    {
+      label: 'Audio & Captions',
+      items: [
+        { icon: Type, text: 'Add captions' },
+        { icon: VolumeX, text: 'Remove dead air / silence' },
+        { icon: Wand2, text: 'Remove background noise' },
+        { icon: Music, text: 'Extract audio to A1' },
+        { icon: Waves, text: 'Normalize audio loudness' },
+        { icon: VolumeX, text: 'Mute filler words (um, uh)' },
+      ],
+    },
+    {
+      label: 'Camera Effects',
+      items: [
+        { icon: Move, text: 'Add Ken Burns zoom effect' },
+        { icon: ZoomIn, text: 'Slow zoom in on subject' },
+        { icon: Maximize2, text: 'Zoom out to reveal scene' },
+        { icon: Camera, text: 'Add subtle camera drift' },
+        { icon: Move, text: 'Diagonal pan across scene' },
+        { icon: Aperture, text: 'Add dolly zoom (Vertigo effect)' },
+        { icon: RotateCcw, text: 'Add slow rotation effect' },
+        { icon: Camera, text: 'Add handheld camera shake' },
+        { icon: Layers, text: 'Add parallax depth effect' },
+        { icon: Film, text: 'Add whip pan transition' },
+      ],
+    },
+    {
+      label: 'Color & Look',
+      items: [
+        { icon: Palette, text: 'Apply cinematic color grade' },
+        { icon: Sun, text: 'Apply warm tone preset' },
+        { icon: Sliders, text: 'Apply cool tone preset' },
+        { icon: Film, text: 'Apply vintage film look' },
+        { icon: Palette, text: 'Apply black and white look' },
+        { icon: Palette, text: 'Apply bleach bypass look' },
+        { icon: Sun, text: 'Increase brightness slightly' },
+        { icon: Sliders, text: 'Boost contrast' },
+      ],
+    },
+    {
+      label: 'Video & Animations',
+      items: [
+        { icon: Clock, text: 'Speed up by 1.5x' },
+        { icon: Scissors, text: 'Cut at chapters' },
+        { icon: FileVideo, text: 'Add GIF animations' },
+        { icon: Image, text: 'Add B-roll images' },
+        { icon: Sparkles, text: 'Create demo animation' },
+        { icon: Zap, text: 'Animate transcript' },
+        { icon: Film, text: 'Add 5 animations' },
+        { icon: Scissors, text: 'Detect scene changes' },
+      ],
+    },
+    {
+      label: 'New Features',
+      items: [
+        { icon: Camera, text: 'Auto-reframe to center subject' },
+        { icon: Film, text: 'Create highlight reel (60s)' },
+        { icon: Image, text: 'Generate thumbnail' },
+        { icon: Sliders, text: 'Preview silence report' },
+        { icon: Type, text: 'Translate captions to Spanish' },
+        { icon: Music, text: 'Duck background music under speech' },
+        { icon: Type, text: 'Export captions as SRT file' },
+      ],
+    },
   ];
 
   // Persist caption style to localStorage whenever it changes
@@ -4331,20 +4383,29 @@ export default function AIPromptPanel({
                   <div className="border-t border-zinc-700/60 mb-2" />
                 </div>
               )}
-              <div className="grid grid-cols-2 gap-1.5">
-                {suggestions.map((suggestion, idx) => (
-                  <button
-                    key={idx}
-                    type="button"
-                    onClick={() => {
-                      setPrompt(suggestion.text);
-                      setShowQuickActions(false);
-                    }}
-                    className="flex items-center gap-2 px-3 py-2.5 bg-zinc-700/50 hover:bg-zinc-700 rounded-lg text-xs text-left transition-colors group"
-                  >
-                    <suggestion.icon className="w-4 h-4 text-zinc-400 group-hover:text-orange-400 transition-colors flex-shrink-0" />
-                    <span className="text-zinc-300 leading-tight">{suggestion.text}</span>
-                  </button>
+              <div className="space-y-3">
+                {suggestionGroups.map((group) => (
+                  <div key={group.label}>
+                    <div className="flex items-center gap-1 px-1 mb-1.5">
+                      <span className="text-[10px] font-semibold text-zinc-500 uppercase tracking-widest">{group.label}</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-1">
+                      {group.items.map((suggestion, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          onClick={() => {
+                            setPrompt(suggestion.text);
+                            setShowQuickActions(false);
+                          }}
+                          className="flex items-center gap-2 px-2.5 py-2 bg-zinc-700/50 hover:bg-zinc-700 rounded-lg text-xs text-left transition-colors group"
+                        >
+                          <suggestion.icon className="w-3.5 h-3.5 text-zinc-400 group-hover:text-orange-400 transition-colors flex-shrink-0" />
+                          <span className="text-zinc-300 leading-tight">{suggestion.text}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 ))}
               </div>
             </div>
