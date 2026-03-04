@@ -8384,9 +8384,10 @@ async function handleProcessAsset(req, res, sessionId) {
     }
 
     const jobId = randomUUID();
-    const newAssetId = randomUUID();
-    const outputPath = join(session.assetsDir, `${newAssetId}.mp4`);
-    const thumbPath = join(session.assetsDir, `${newAssetId}_thumb.jpg`);
+    // Use a temp path then rename over the original so clips don't need updating
+    const tempId = randomUUID();
+    const outputPath = join(session.assetsDir, `${tempId}.mp4`);
+    const thumbPath = asset.thumbPath || join(session.assetsDir, `${assetId}_thumb.jpg`);
 
     console.log(`\n[${jobId}] === PROCESS ASSET WITH FFMPEG ===`);
     console.log(`[${jobId}] Source: ${asset.filename}`);
@@ -8439,23 +8440,25 @@ async function handleProcessAsset(req, res, sessionId) {
 
     await runFFmpeg(ffmpegArgs, jobId);
 
-    // Generate thumbnail
+    // Replace original file in-place — clip's assetId stays the same, refreshAssets() cache-busts the URL
+    renameSync(outputPath, asset.path);
+
+    // Regenerate thumbnail
     await runFFmpeg([
-      '-y', '-i', outputPath,
+      '-y', '-i', asset.path,
       '-vf', 'scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2',
       '-frames:v', '1',
       thumbPath
     ], jobId);
 
-    // Get video info
+    // Update asset metadata
     const { stat } = await import('fs/promises');
-    const stats = await stat(outputPath);
+    const stats = await stat(asset.path);
 
-    // Get duration with ffprobe
     let duration = asset.duration;
     try {
       const durationStr = execSync(
-        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputPath}"`,
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${asset.path}"`,
         { encoding: 'utf-8' }
       ).trim();
       duration = parseFloat(durationStr) || asset.duration;
@@ -8463,36 +8466,30 @@ async function handleProcessAsset(req, res, sessionId) {
       console.warn(`[${jobId}] Could not get duration:`, e.message);
     }
 
-    // Create new asset entry
-    const newAsset = {
-      id: newAssetId,
-      type: 'video',
-      filename: `edited-${asset.filename}`,
-      path: outputPath,
-      thumbPath: existsSync(thumbPath) ? thumbPath : null,
+    // Update the existing asset entry in-place
+    session.assets.set(assetId, {
+      ...asset,
       duration,
       size: stats.size,
-      width: asset.width || 1920,
-      height: asset.height || 1080,
-      createdAt: Date.now(),
-      // Metadata
-      sourceAssetId: assetId,
-      ffmpegCommand: command,
-    };
+      thumbPath,
+      editCount: (asset.editCount || 0) + 1,
+      lastEditCommand: command,
+    });
 
-    session.assets.set(newAssetId, newAsset);
+    await saveAssetMetadata(session);
 
-    console.log(`[${jobId}] Asset processed: ${newAssetId} (${duration.toFixed(2)}s)`);
-    console.log(`[${jobId}] === PROCESSING COMPLETE ===\n`);
+    console.log(`[${jobId}] Asset edited in-place: ${assetId} (${duration.toFixed(2)}s)`);
+    console.log(`[${jobId}] === PROCESSING COMPLETE ===
+`);
 
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({
       success: true,
-      assetId: newAssetId,
-      filename: newAsset.filename,
+      assetId,
+      filename: asset.filename,
       duration,
-      thumbnailUrl: `/session/${sessionId}/assets/${newAssetId}/thumbnail`,
-      streamUrl: `/session/${sessionId}/assets/${newAssetId}/stream`,
+      thumbnailUrl: `/session/${sessionId}/assets/${assetId}/thumbnail`,
+      streamUrl: `/session/${sessionId}/assets/${assetId}/stream`,
     }));
 
   } catch (error) {

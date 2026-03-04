@@ -601,21 +601,12 @@ export default function Home() {
     }
 
     const result = await response.json();
-    console.log('Edit applied, new asset:', result.assetId);
+    console.log('Edit applied in-place, assetId:', result.assetId);
 
-    // Refresh assets to get the new processed asset
+    // Process-asset edits the file in-place (same assetId).
+    // refreshAssets() cache-busts the stream URL so VideoPreview reloads automatically.
     await refreshAssets();
-
-    // Optionally replace clips using the old asset with the new one
-    if (result.assetId && result.assetId !== targetAssetId) {
-      // Find clips using the old asset and update them to use the new one
-      const clipsToUpdate = clips.filter(c => c.assetId === targetAssetId);
-      for (const clip of clipsToUpdate) {
-        updateClip(clip.id, { assetId: result.assetId });
-      }
-      await saveProject();
-    }
-  }, [session, assets, clips, selectedClipId, refreshAssets, updateClip, saveProject]);
+  }, [session, assets, clips, selectedClipId, refreshAssets]);
 
   // Handle chapter generation
   const handleGenerateChapters = useCallback(async () => {
