@@ -6,6 +6,12 @@ import { AnimatedEmoji, getAvailableEmojis } from '@remotion/animated-emoji';
 import { Gif } from '@remotion/gif';
 import { Lottie, LottieAnimationData } from '@remotion/lottie';
 import { Scene3D, Scene3DConfig } from './components/Scene3D';
+import { TransitionSeries, linearTiming, springTiming } from '@remotion/transitions';
+import { fade } from '@remotion/transitions/fade';
+import { slide } from '@remotion/transitions/slide';
+import { wipe } from '@remotion/transitions/wipe';
+import { flip } from '@remotion/transitions/flip';
+import { clockWipe } from '@remotion/transitions/clock-wipe';
 
 // Shape definition for shapes scene
 export interface ShapeConfig {
@@ -126,7 +132,7 @@ export interface Scene {
     videoMuted?: boolean; // Mute audio
     // Media animation (applied to the media itself)
     mediaAnimation?: {
-      type: 'none' | 'ken-burns' | 'zoom-in' | 'zoom-out' | 'pan-left' | 'pan-right' | 'pan-up' | 'pan-down' | 'rotate' | 'parallax';
+      type: 'none' | 'ken-burns' | 'zoom-in' | 'zoom-out' | 'pan-left' | 'pan-right' | 'pan-up' | 'pan-down' | 'rotate' | 'parallax' | 'pulse' | 'glow';
       intensity?: number; // 0-1
     };
     // For multiple media (montage/collage)
@@ -324,6 +330,528 @@ const GlowingOrb: React.FC<{
     />
   );
 };
+
+// ==================== ADVANCED VISUAL EFFECTS ====================
+
+// Neon glow text with pulsing animation
+const NeonText: React.FC<{
+  text: string;
+  fontSize: number;
+  color: string;
+  delay?: number;
+}> = ({ text, fontSize, color, delay = 0 }) => {
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
+
+  const entryScale = spring({
+    frame: frame - delay,
+    fps,
+    config: { damping: 8, stiffness: 150 },
+  });
+
+  const glowIntensity = interpolate(
+    Math.sin((frame - delay) * 0.15),
+    [-1, 1],
+    [0.6, 1]
+  );
+
+  const flicker = frame % 60 < 3 ? 0.7 : 1;
+
+  return (
+    <div
+      style={{
+        fontSize,
+        fontWeight: 900,
+        fontFamily: 'Inter, system-ui, sans-serif',
+        color: color,
+        textTransform: 'uppercase',
+        letterSpacing: '0.1em',
+        transform: `scale(${entryScale})`,
+        opacity: entryScale * flicker,
+        textShadow: `
+          0 0 5px ${color},
+          0 0 10px ${color},
+          0 0 20px ${color},
+          0 0 40px ${color}${Math.round(glowIntensity * 99).toString(16).padStart(2, '0')},
+          0 0 80px ${color}${Math.round(glowIntensity * 66).toString(16).padStart(2, '0')},
+          0 0 120px ${color}${Math.round(glowIntensity * 44).toString(16).padStart(2, '0')}
+        `,
+      }}
+    >
+      {text}
+    </div>
+  );
+};
+
+// Floating particles background
+const ParticleField: React.FC<{
+  count?: number;
+  color?: string;
+  speed?: number;
+}> = ({ count = 50, color = '#ffffff', speed = 1 }) => {
+  const frame = useCurrentFrame();
+
+  const particles = useMemo(() => {
+    return Array.from({ length: count }, (_, i) => ({
+      x: Math.random() * 100,
+      y: Math.random() * 100,
+      size: 2 + Math.random() * 4,
+      speedX: (Math.random() - 0.5) * 0.5 * speed,
+      speedY: (Math.random() - 0.5) * 0.5 * speed,
+      opacity: 0.2 + Math.random() * 0.6,
+      pulse: Math.random() * Math.PI * 2,
+    }));
+  }, [count, speed]);
+
+  return (
+    <div style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
+      {particles.map((p, i) => {
+        const x = (p.x + frame * p.speedX) % 100;
+        const y = (p.y + frame * p.speedY) % 100;
+        const pulse = 0.5 + Math.sin(frame * 0.1 + p.pulse) * 0.5;
+
+        return (
+          <div
+            key={i}
+            style={{
+              position: 'absolute',
+              left: `${x}%`,
+              top: `${y}%`,
+              width: p.size * pulse,
+              height: p.size * pulse,
+              borderRadius: '50%',
+              backgroundColor: color,
+              opacity: p.opacity * pulse,
+              boxShadow: `0 0 ${p.size * 2}px ${color}`,
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+};
+
+// Light beam/ray effect
+const LightBeams: React.FC<{
+  color?: string;
+  beamCount?: number;
+}> = ({ color = '#ffffff', beamCount = 8 }) => {
+  const frame = useCurrentFrame();
+
+  const beams = useMemo(() => {
+    return Array.from({ length: beamCount }, (_, i) => ({
+      angle: (i / beamCount) * 360,
+      width: 20 + Math.random() * 40,
+      opacity: 0.1 + Math.random() * 0.2,
+    }));
+  }, [beamCount]);
+
+  return (
+    <div style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
+      <div
+        style={{
+          position: 'absolute',
+          top: '50%',
+          left: '50%',
+          transform: `translate(-50%, -50%) rotate(${frame * 0.5}deg)`,
+        }}
+      >
+        {beams.map((beam, i) => (
+          <div
+            key={i}
+            style={{
+              position: 'absolute',
+              top: '50%',
+              left: '50%',
+              width: beam.width,
+              height: 2000,
+              background: `linear-gradient(to bottom, transparent, ${color}${Math.round(beam.opacity * 255).toString(16).padStart(2, '0')}, transparent)`,
+              transform: `rotate(${beam.angle + frame * 0.3}deg) translateY(-50%)`,
+              transformOrigin: 'center top',
+            }}
+          />
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// Confetti celebration effect
+const Confetti: React.FC<{
+  colors?: string[];
+  count?: number;
+}> = ({ colors = ['#f97316', '#3b82f6', '#22c55e', '#8b5cf6', '#ec4899'], count = 60 }) => {
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
+
+  const pieces = useMemo(() => {
+    return Array.from({ length: count }, (_, i) => ({
+      x: Math.random() * 100,
+      delay: Math.random() * 20,
+      speed: 2 + Math.random() * 3,
+      rotation: Math.random() * 360,
+      rotationSpeed: (Math.random() - 0.5) * 20,
+      size: 8 + Math.random() * 12,
+      color: colors[Math.floor(Math.random() * colors.length)],
+      shape: Math.random() > 0.5 ? 'rect' : 'circle',
+    }));
+  }, [count, colors]);
+
+  return (
+    <div style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
+      {pieces.map((p, i) => {
+        const progress = spring({
+          frame: frame - p.delay,
+          fps,
+          config: { damping: 50, stiffness: 50 },
+        });
+
+        const y = -20 + progress * 120;
+        const rotation = p.rotation + frame * p.rotationSpeed;
+        const wobble = Math.sin(frame * 0.2 + i) * 20;
+
+        return (
+          <div
+            key={i}
+            style={{
+              position: 'absolute',
+              left: `${p.x + wobble * 0.3}%`,
+              top: `${y}%`,
+              width: p.shape === 'rect' ? p.size : p.size,
+              height: p.shape === 'rect' ? p.size * 0.6 : p.size,
+              backgroundColor: p.color,
+              borderRadius: p.shape === 'circle' ? '50%' : 2,
+              transform: `rotate(${rotation}deg)`,
+              opacity: interpolate(y, [80, 100], [1, 0], { extrapolateLeft: 'clamp' }),
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+};
+
+// Glass morphism card
+const GlassCard: React.FC<{
+  children: React.ReactNode;
+  width?: number;
+  height?: number;
+  borderColor?: string;
+}> = ({ children, width = 600, height = 400, borderColor = '#ffffff33' }) => {
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
+
+  const scale = spring({
+    frame,
+    fps,
+    config: { damping: 12, stiffness: 100 },
+  });
+
+  return (
+    <div
+      style={{
+        width,
+        height,
+        background: 'rgba(255, 255, 255, 0.05)',
+        backdropFilter: 'blur(20px)',
+        borderRadius: 24,
+        border: `1px solid ${borderColor}`,
+        boxShadow: '0 25px 50px rgba(0, 0, 0, 0.5)',
+        transform: `scale(${scale})`,
+        display: 'flex',
+        justifyContent: 'center',
+        alignItems: 'center',
+        overflow: 'hidden',
+      }}
+    >
+      {children}
+    </div>
+  );
+};
+
+// Animated border with traveling light
+const AnimatedBorder: React.FC<{
+  width: number;
+  height: number;
+  color?: string;
+  thickness?: number;
+}> = ({ width, height, color = '#f97316', thickness = 3 }) => {
+  const frame = useCurrentFrame();
+  const perimeter = 2 * (width + height);
+  const position = (frame * 10) % perimeter;
+
+  // Calculate position along the border
+  let x = 0, y = 0, gradientAngle = 0;
+
+  if (position < width) {
+    x = position;
+    y = 0;
+    gradientAngle = 90;
+  } else if (position < width + height) {
+    x = width;
+    y = position - width;
+    gradientAngle = 180;
+  } else if (position < 2 * width + height) {
+    x = width - (position - width - height);
+    y = height;
+    gradientAngle = 270;
+  } else {
+    x = 0;
+    y = height - (position - 2 * width - height);
+    gradientAngle = 0;
+  }
+
+  return (
+    <div style={{ position: 'absolute', inset: 0 }}>
+      {/* Base border */}
+      <div
+        style={{
+          position: 'absolute',
+          inset: 0,
+          border: `${thickness}px solid ${color}33`,
+          borderRadius: 20,
+        }}
+      />
+      {/* Traveling light */}
+      <div
+        style={{
+          position: 'absolute',
+          left: x - 30,
+          top: y - 30,
+          width: 60,
+          height: 60,
+          borderRadius: '50%',
+          background: `radial-gradient(circle, ${color}, transparent)`,
+          filter: 'blur(10px)',
+        }}
+      />
+    </div>
+  );
+};
+
+// 3D rotating text
+const Text3D: React.FC<{
+  text: string;
+  fontSize: number;
+  color: string;
+  rotateX?: boolean;
+  rotateY?: boolean;
+}> = ({ text, fontSize, color, rotateX = false, rotateY = true }) => {
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
+
+  const entryProgress = spring({
+    frame,
+    fps,
+    config: { damping: 12, stiffness: 80 },
+  });
+
+  const rotX = rotateX ? Math.sin(frame * 0.05) * 15 : 0;
+  const rotY = rotateY ? Math.sin(frame * 0.03) * 10 : 0;
+
+  return (
+    <div style={{ perspective: 1000 }}>
+      <div
+        style={{
+          fontSize,
+          fontWeight: 900,
+          fontFamily: 'Inter, system-ui, sans-serif',
+          color,
+          transform: `
+            scale(${entryProgress})
+            rotateX(${rotX}deg)
+            rotateY(${rotY}deg)
+          `,
+          textShadow: `
+            1px 1px 0 ${color}88,
+            2px 2px 0 ${color}66,
+            3px 3px 0 ${color}44,
+            4px 4px 0 ${color}22,
+            5px 5px 10px rgba(0,0,0,0.5)
+          `,
+        }}
+      >
+        {text}
+      </div>
+    </div>
+  );
+};
+
+// Scan line effect (retro/CRT)
+const ScanLines: React.FC<{
+  opacity?: number;
+  lineHeight?: number;
+}> = ({ opacity = 0.1, lineHeight = 4 }) => {
+  const frame = useCurrentFrame();
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        inset: 0,
+        background: `repeating-linear-gradient(
+          0deg,
+          transparent,
+          transparent ${lineHeight - 1}px,
+          rgba(0, 0, 0, ${opacity}) ${lineHeight}px
+        )`,
+        animation: `scanlines 0.1s linear infinite`,
+        pointerEvents: 'none',
+        transform: `translateY(${(frame * 2) % lineHeight}px)`,
+      }}
+    />
+  );
+};
+
+// Morphing blob background
+const MorphingBlob: React.FC<{
+  color?: string;
+  size?: number;
+  x?: number;
+  y?: number;
+}> = ({ color = '#8b5cf6', size = 400, x = 50, y = 50 }) => {
+  const frame = useCurrentFrame();
+
+  // Create morphing effect using multiple sin waves
+  const morph1 = 50 + Math.sin(frame * 0.03) * 20;
+  const morph2 = 50 + Math.cos(frame * 0.04) * 15;
+  const morph3 = 50 + Math.sin(frame * 0.05 + 1) * 25;
+  const morph4 = 50 + Math.cos(frame * 0.035 + 2) * 18;
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        left: `${x}%`,
+        top: `${y}%`,
+        width: size,
+        height: size,
+        transform: 'translate(-50%, -50%)',
+        background: `radial-gradient(circle, ${color}88, ${color}44, transparent)`,
+        borderRadius: `${morph1}% ${morph2}% ${morph3}% ${morph4}% / ${morph2}% ${morph3}% ${morph4}% ${morph1}%`,
+        filter: `blur(${size / 8}px)`,
+        opacity: 0.8,
+      }}
+    />
+  );
+};
+
+// Electric/lightning effect
+const ElectricArc: React.FC<{
+  color?: string;
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
+}> = ({ color = '#3b82f6', startX, startY, endX, endY }) => {
+  const frame = useCurrentFrame();
+
+  // Generate lightning path points
+  const points = useMemo(() => {
+    const pts = [];
+    const segments = 8;
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      const x = startX + (endX - startX) * t + (i > 0 && i < segments ? (Math.random() - 0.5) * 50 : 0);
+      const y = startY + (endY - startY) * t + (i > 0 && i < segments ? (Math.random() - 0.5) * 50 : 0);
+      pts.push({ x, y });
+    }
+    return pts;
+  }, [startX, startY, endX, endY, Math.floor(frame / 3)]); // Regenerate every 3 frames
+
+  const opacity = frame % 6 < 3 ? 1 : 0.3; // Flicker effect
+
+  const pathD = `M ${points.map(p => `${p.x} ${p.y}`).join(' L ')}`;
+
+  return (
+    <svg
+      style={{
+        position: 'absolute',
+        inset: 0,
+        width: '100%',
+        height: '100%',
+        opacity,
+      }}
+    >
+      <path
+        d={pathD}
+        stroke={color}
+        strokeWidth={3}
+        fill="none"
+        filter="url(#glow)"
+        style={{
+          filter: `drop-shadow(0 0 10px ${color}) drop-shadow(0 0 20px ${color})`,
+        }}
+      />
+    </svg>
+  );
+};
+
+// Kinetic typography - words flying in from different directions
+const KineticText: React.FC<{
+  words: string[];
+  fontSize: number;
+  color: string;
+  stagger?: number;
+}> = ({ words, fontSize, color, stagger = 10 }) => {
+  const frame = useCurrentFrame();
+  const { fps, width, height } = useVideoConfig();
+
+  const directions = ['left', 'right', 'top', 'bottom', 'scale'];
+
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: 20 }}>
+      {words.map((word, i) => {
+        const delay = i * stagger;
+        const direction = directions[i % directions.length];
+
+        const progress = spring({
+          frame: frame - delay,
+          fps,
+          config: { damping: 12, stiffness: 100 },
+        });
+
+        let transform = '';
+        switch (direction) {
+          case 'left':
+            transform = `translateX(${interpolate(progress, [0, 1], [-200, 0])}px)`;
+            break;
+          case 'right':
+            transform = `translateX(${interpolate(progress, [0, 1], [200, 0])}px)`;
+            break;
+          case 'top':
+            transform = `translateY(${interpolate(progress, [0, 1], [-100, 0])}px)`;
+            break;
+          case 'bottom':
+            transform = `translateY(${interpolate(progress, [0, 1], [100, 0])}px)`;
+            break;
+          case 'scale':
+            transform = `scale(${interpolate(progress, [0, 1], [0, 1])})`;
+            break;
+        }
+
+        return (
+          <span
+            key={i}
+            style={{
+              fontSize,
+              fontWeight: 900,
+              fontFamily: 'Inter, system-ui, sans-serif',
+              color,
+              transform,
+              opacity: progress,
+              textShadow: `0 0 20px ${color}66`,
+            }}
+          >
+            {word}
+          </span>
+        );
+      })}
+    </div>
+  );
+};
+
+// ==================== END ADVANCED VISUAL EFFECTS ====================
 
 // Animated text with character-by-character reveal
 const AnimatedText: React.FC<{
@@ -913,18 +1441,19 @@ const SceneTransition: React.FC<{
   return null;
 };
 
-// Enhanced Title Scene
+// Enhanced Title Scene - with impressive visual effects
 const TitleScene: React.FC<{ content: Scene['content'] }> = ({ content }) => {
   const frame = useCurrentFrame();
   const { fps, durationInFrames } = useVideoConfig();
 
   const accentColor = content.color || '#f97316';
+  const secondaryColor = '#3b82f6';
 
   // Entry animations
   const titleScale = spring({
     frame,
     fps,
-    config: { damping: 12, stiffness: 100 },
+    config: { damping: 10, stiffness: 120 },
   });
 
   // Scale animation timing based on scene duration
@@ -949,14 +1478,23 @@ const TitleScene: React.FC<{ content: Scene['content'] }> = ({ content }) => {
         overflow: 'hidden',
       }}
     >
+      {/* Advanced background effects */}
       <GradientBackground color1="#0a0a0a" color2={accentColor + '33'} color3="#0a0a0a" />
+      <ParticleField count={40} color={accentColor} speed={0.8} />
+      <MorphingBlob color={accentColor} size={500} x={25} y={35} />
+      <MorphingBlob color={secondaryColor} size={400} x={75} y={65} />
+
+      {/* Light beams for dramatic effect */}
+      <LightBeams color={accentColor} beamCount={6} />
 
       {/* Decorative orbs */}
-      <GlowingOrb x={20} y={30} size={200} color={accentColor} delay={5} />
-      <GlowingOrb x={80} y={70} size={150} color="#3b82f6" delay={10} />
+      <GlowingOrb x={15} y={25} size={250} color={accentColor} delay={0} />
+      <GlowingOrb x={85} y={75} size={200} color={secondaryColor} delay={5} />
+      <GlowingOrb x={50} y={85} size={180} color="#8b5cf6" delay={10} />
 
       {/* Explosion on entry */}
-      {frame < 30 && <ExplosionEffect color={accentColor} particleCount={16} delay={5} />}
+      {frame < 40 && <ExplosionEffect color={accentColor} particleCount={24} delay={3} />}
+      {frame < 50 && frame > 10 && <Confetti colors={[accentColor, secondaryColor, '#22c55e', '#ec4899']} count={40} />}
 
       <div
         style={{
@@ -967,11 +1505,10 @@ const TitleScene: React.FC<{ content: Scene['content'] }> = ({ content }) => {
         }}
       >
         {content.title && (
-          <AnimatedText
+          <NeonText
             text={content.title}
-            fontSize={90}
+            fontSize={100}
             color={content.color || '#ffffff'}
-            style="bounce"
             delay={0}
           />
         )}
@@ -979,14 +1516,14 @@ const TitleScene: React.FC<{ content: Scene['content'] }> = ({ content }) => {
         {content.subtitle && (
           <div
             style={{
-              marginTop: 30,
+              marginTop: 40,
               opacity: subtitleOpacity,
               transform: `translateY(${subtitleY}px)`,
             }}
           >
             <AnimatedText
               text={content.subtitle}
-              fontSize={36}
+              fontSize={40}
               color="#a1a1aa"
               style="wave"
               delay={isShort ? Math.round(durationInFrames * 0.15) : 25}
@@ -1258,20 +1795,28 @@ const StatsScene: React.FC<{ content: Scene['content'] }> = ({ content }) => {
         overflow: 'hidden',
       }}
     >
+      {/* Enhanced background effects */}
       <GradientBackground color1="#0a0a0a" color2={accentColor + '22'} color3="#0f0f23" />
+      <ParticleField count={30} color={accentColor} speed={0.5} />
+      <MorphingBlob color={accentColor} size={350} x={20} y={70} />
+      <MorphingBlob color="#3b82f6" size={300} x={80} y={30} />
+
+      {/* Decorative orbs */}
+      <GlowingOrb x={10} y={50} size={180} color={accentColor} delay={0} />
+      <GlowingOrb x={90} y={50} size={160} color="#3b82f6" delay={5} />
 
       {content.title && (
         <div
           style={{
             position: 'absolute',
-            top: 100,
+            top: 80,
           }}
         >
-          <AnimatedText
+          <NeonText
             text={content.title}
-            fontSize={52}
+            fontSize={56}
             color={content.color || '#ffffff'}
-            style="bounce"
+            delay={0}
           />
         </div>
       )}
@@ -1505,6 +2050,18 @@ const MediaAnimationWrapper: React.FC<{
       const parallaxX = Math.sin(frame * 0.02) * maxMove * 0.3;
       const parallaxY = Math.cos(frame * 0.015) * maxMove * 0.2;
       transform = `translate(${parallaxX}px, ${parallaxY}px)`;
+      break;
+    }
+    case 'pulse': {
+      // Pulsing scale effect - perfect for borders/glows
+      const pulseScale = 1 + Math.sin(frame * 0.15) * intensity * 0.1;
+      transform = `scale(${pulseScale})`;
+      break;
+    }
+    case 'glow': {
+      // Glow effect combined with subtle pulse
+      const glowPulse = 1 + Math.sin(frame * 0.1) * intensity * 0.05;
+      transform = `scale(${glowPulse})`;
       break;
     }
     default:
@@ -2686,7 +3243,12 @@ const EmojiScene: React.FC<{ content: Scene['content'] }> = ({ content }) => {
         overflow: 'hidden',
       }}
     >
-      <GradientBackground color1="#0a0a0a" color2={accentColor + '22'} color3="#0f0f23" />
+      {/* Enhanced background effects for emoji scene */}
+      <GradientBackground color1="#0a0a0a" color2={accentColor + '33'} color3="#0f0f23" />
+      <ParticleField count={35} color={accentColor} speed={0.6} />
+      <MorphingBlob color={accentColor} size={400} x={30} y={60} />
+      <MorphingBlob color="#ec4899" size={350} x={70} y={40} />
+      <GlowingOrb x={50} y={50} size={300} color={accentColor} delay={0} />
 
       {/* Title */}
       {content.title && (
@@ -2697,7 +3259,7 @@ const EmojiScene: React.FC<{ content: Scene['content'] }> = ({ content }) => {
             zIndex: 20,
           }}
         >
-          <AnimatedText
+          <NeonText
             text={content.title}
             fontSize={52}
             color="#ffffff"
@@ -3298,13 +3860,92 @@ const SceneRenderer: React.FC<{ scene: Scene }> = ({ scene }) => {
   return content;
 };
 
+// Helper to map scene transition type to @remotion/transitions presentation
+const getTransitionPresentation = (transitionType?: string, direction?: string) => {
+  switch (transitionType) {
+    case 'fade':
+      return fade();
+    case 'swipe-left':
+      return slide({ direction: 'from-right' });
+    case 'swipe-right':
+      return slide({ direction: 'from-left' });
+    case 'swipe-up':
+      return slide({ direction: 'from-bottom' });
+    case 'swipe-down':
+      return slide({ direction: 'from-top' });
+    case 'wipe-left':
+      return wipe({ direction: 'from-right' });
+    case 'wipe-right':
+      return wipe({ direction: 'from-left' });
+    case 'flip':
+      return flip({ direction: 'from-left' });
+    case 'zoom-in':
+    case 'zoom-out':
+      return fade(); // Fallback to fade for zoom effects
+    case 'blur':
+      return fade(); // Fallback
+    case 'clock':
+      return clockWipe();
+    default:
+      return fade();
+  }
+};
+
 // Main Dynamic Animation Component
 export const DynamicAnimation: React.FC<DynamicAnimationProps> = ({
   scenes,
   backgroundColor = '#0a0a0a',
 }) => {
-  let frameOffset = 0;
+  // If no scenes or only one scene, use simple sequence
+  if (!scenes || scenes.length === 0) {
+    return <AbsoluteFill style={{ backgroundColor }} />;
+  }
 
+  // Check if any scene has a transition
+  const hasTransitions = scenes.some(s => s.transition && s.transition.type !== 'none');
+
+  // Use TransitionSeries for smooth transitions between scenes
+  if (hasTransitions && scenes.length > 1) {
+    return (
+      <AbsoluteFill style={{ backgroundColor }}>
+        <TransitionSeries>
+          {scenes.map((scene, index) => {
+            const elements: React.ReactNode[] = [];
+
+            // Add the scene
+            elements.push(
+              <TransitionSeries.Sequence
+                key={`scene-${scene.id || index}`}
+                durationInFrames={scene.duration}
+              >
+                <SceneRenderer scene={scene} />
+              </TransitionSeries.Sequence>
+            );
+
+            // Add transition after this scene (except for last scene)
+            if (index < scenes.length - 1 && scene.transition && scene.transition.type !== 'none') {
+              const transitionDuration = scene.transition.duration || 15;
+              elements.push(
+                <TransitionSeries.Transition
+                  key={`trans-${scene.id || index}`}
+                  presentation={getTransitionPresentation(scene.transition.type)}
+                  timing={springTiming({
+                    config: { damping: 15, stiffness: 100 },
+                    durationInFrames: transitionDuration,
+                  })}
+                />
+              );
+            }
+
+            return elements;
+          })}
+        </TransitionSeries>
+      </AbsoluteFill>
+    );
+  }
+
+  // Fallback to simple sequences without transitions
+  let frameOffset = 0;
   return (
     <AbsoluteFill style={{ backgroundColor }}>
       {scenes.map((scene, index) => {

@@ -2247,25 +2247,60 @@ async function handleProjectRender(req, res, sessionId) {
       // at t=clip.start, causing FFmpeg to look for frames that don't exist yet.
       clipFilter += `trim=${inPoint}:${outPoint},setpts=PTS-STARTPTS+(${clip.start}/TB),`;
 
-      // Scale/fit to canvas
-      clipFilter += `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,`;
-      clipFilter += `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2`;
+      // Check if this is an overlay track (V2, V3, etc.)
+      const isOverlayTrack = clip.trackId && clip.trackId !== 'V1';
 
-      // Apply transform if present
-      if (clip.transform) {
-        const { x = 0, y = 0, scale = 1, opacity = 1 } = clip.transform;
-        if (scale !== 1) {
-          clipFilter += `,scale=iw*${scale}:ih*${scale}`;
-        }
-        // Opacity is handled in overlay
+      if (isOverlayTrack) {
+        // V2/V3 overlay clips - scale to a percentage of canvas, don't fill frame
+        const transformScale = clip.transform?.scale ?? 0.2; // Default 20% of canvas width
+        const targetWidth = Math.round(settings.width * transformScale);
+        clipFilter += `scale=${targetWidth}:-1`;
+        console.log(`[${sessionId}] Overlay ${clip.trackId}: scale=${transformScale}, targetWidth=${targetWidth}`);
+      } else {
+        // V1 main video - scale/fit to canvas and center
+        clipFilter += `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,`;
+        clipFilter += `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2`;
       }
 
       clipFilter += `[v${idx}]`;
       filterParts.push(clipFilter);
 
-      // Overlay onto base
-      const overlayX = clip.transform?.x || `(W-w)/2`;
-      const overlayY = clip.transform?.y || `(H-h)/2`;
+      // Overlay onto base - calculate position
+      let overlayX, overlayY;
+      if (isOverlayTrack) {
+        // Get x,y offsets (these are preview pixel values)
+        const xOffset = clip.transform?.x ?? 0;
+        const yOffset = clip.transform?.y ?? 0;
+
+        // The preview size varies by viewport and aspect ratio
+        // 16:9 horizontal: typically ~900px wide (max-w-4xl is ~896px)
+        // 9:16 vertical: typically ~400px wide (h-65vh with 9:16 aspect)
+        const isVertical = settings.height > settings.width;
+        const previewWidth = isVertical ? 400 : 900;
+        const previewHeight = isVertical ? 711 : 506;
+
+        // Scale factor: convert preview pixels to export pixels
+        const scaleFactorX = settings.width / previewWidth;
+        const scaleFactorY = settings.height / previewHeight;
+
+        const scaledXOffset = Math.round(xOffset * scaleFactorX);
+        const scaledYOffset = Math.round(yOffset * scaleFactorY);
+
+        // Position the overlay:
+        // - Base X position is center of frame horizontally
+        // - Base Y position is 70% down (matching preview default of top:70%)
+        // - Apply the user's x,y offsets (scaled to export resolution)
+        overlayX = `(W-w)/2+${scaledXOffset}`;
+        // Use H*0.85 as base Y (85% down from top), then center overlay and add offset
+        overlayY = `H*0.85-h/2+${scaledYOffset}`;
+
+        console.log(`[${sessionId}] Overlay ${clip.trackId} position: xOffset=${xOffset}, yOffset=${yOffset}, preview=${previewWidth}x${previewHeight}`);
+        console.log(`[${sessionId}]   -> scaled=(${scaledXOffset}, ${scaledYOffset}), FFmpeg: x=${overlayX}, y=${overlayY}`);
+      } else {
+        // V1 - center the clip
+        overlayX = `(W-w)/2`;
+        overlayY = `(H-h)/2`;
+      }
       const enable = `between(t,${clip.start},${clip.start + trimDuration})`;
 
       filterParts.push(`[${lastVideo}][v${idx}]overlay=x=${overlayX}:y=${overlayY}:enable='${enable}'[out${idx}]`);
@@ -2549,10 +2584,16 @@ async function handleProjectRender(req, res, sessionId) {
     // Build final command
     const outputPath = join(session.rendersDir, isPreview ? 'preview.mp4' : `export-${Date.now()}.mp4`);
 
+    // Write filter_complex to a file to avoid command line length limits (ENAMETOOLONG)
+    const filterContent = filterParts.join(';');
+    const filterScriptPath = join(session.dir, 'filter_complex.txt');
+    writeFileSync(filterScriptPath, filterContent);
+    console.log(`[${sessionId}] Filter script written to: ${filterScriptPath} (${filterContent.length} chars)`);
+
     const ffmpegArgs = [
       '-y',
       ...inputs,
-      '-filter_complex', filterParts.join(';'),
+      '-filter_complex_script', filterScriptPath,
       '-map', '[vout]',
     ];
 
@@ -10021,6 +10062,704 @@ Use specific terms, concepts, and themes from the transcript.`;
   }
 }
 
+// Generate Remotion composition code from a text prompt
+async function handleGenerateRemotion(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' }));
+    return;
+  }
+
+  try {
+    const body = await parseBody(req);
+    const { prompt } = body;
+
+    if (!prompt) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'prompt is required' }));
+      return;
+    }
+
+    const jobId = sessionId.substring(0, 8);
+    console.log(`\n[${jobId}] === REMOTION CODE GENERATOR ===`);
+    console.log(`[${jobId}] User prompt: ${prompt.substring(0, 200)}...`);
+
+    const ai = new GoogleGenAI({ apiKey });
+
+    const systemPrompt = `You are a Remotion code generator. Output ONLY TypeScript/TSX code with NO explanations, NO markdown, NO prose.
+
+CRITICAL RULES:
+- Output ONLY raw TypeScript/TSX code
+- Do NOT use markdown code blocks (\`\`\`)
+- Do NOT include any explanations or comments outside the code
+- Start directly with "import" statement
+- End with the config export
+
+REQUIRED STRUCTURE:
+1. Import from 'remotion': useCurrentFrame, useVideoConfig, interpolate, spring, Sequence, Easing, AbsoluteFill
+2. Import React
+3. Define main component with animations
+4. Export config object with id, component, durationInFrames, fps, width, height
+
+ANIMATION APIs:
+- interpolate(frame, [start, end], [valueStart, valueEnd], { easing })
+- spring({ frame, fps, config: { damping, stiffness } })
+- Sequence from/durationInFrames for timing
+- AbsoluteFill for full-frame containers
+- Easing.out, Easing.inOut, Easing.bezier() for smooth motion
+
+DEFAULT CONFIG (if not specified):
+- width: 1920, height: 1080, fps: 30, durationInFrames: 240 (8 seconds)
+
+OUTPUT EXACTLY THIS FORMAT:
+import React from 'react';
+import { useCurrentFrame, useVideoConfig, interpolate, spring, AbsoluteFill, Sequence, Easing } from 'remotion';
+
+export const MyComposition: React.FC = () => {
+  const frame = useCurrentFrame();
+  const { fps, width, height } = useVideoConfig();
+
+  // Your animation code here
+
+  return (
+    <AbsoluteFill style={{ backgroundColor: '#000' }}>
+      {/* Animated elements */}
+    </AbsoluteFill>
+  );
+};
+
+export const myCompositionConfig = {
+  id: 'MyComposition',
+  component: MyComposition,
+  durationInFrames: 240,
+  fps: 30,
+  width: 1920,
+  height: 1080,
+};`;
+
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{
+        role: 'user',
+        parts: [{ text: `Generate a single, complete Remotion composition TSX file for the following request. Output ONLY the raw TypeScript code, starting with "import React" and ending with the config export object. Do NOT include any markdown formatting, code blocks, explanations, setup instructions, or prose. Just the code.\n\nRequest: ${prompt}` }]
+      }],
+      systemInstruction: systemPrompt,
+    });
+
+    const generatedCode = result.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+
+    if (!generatedCode || generatedCode.length < 50) {
+      throw new Error('Failed to generate valid Remotion code');
+    }
+
+    // Extract code from markdown blocks if present, otherwise use as-is
+    let cleanCode = generatedCode;
+
+    // If response contains markdown code blocks, extract the largest one
+    const codeBlockMatch = generatedCode.match(/```(?:tsx?|typescript|javascript)?\s*\n([\s\S]*?)```/g);
+    if (codeBlockMatch && codeBlockMatch.length > 0) {
+      // Find the largest code block (likely the main component)
+      const blocks = codeBlockMatch.map(block =>
+        block.replace(/^```(?:tsx?|typescript|javascript)?\s*\n?/, '').replace(/\n?```$/, '')
+      );
+      cleanCode = blocks.reduce((a, b) => a.length > b.length ? a : b);
+    } else if (cleanCode.startsWith('```')) {
+      // Single code block wrapping everything
+      cleanCode = cleanCode.replace(/^```(?:tsx?|typescript|javascript)?\s*\n?/, '').replace(/\n?```$/, '');
+    }
+
+    // If code doesn't start with import, try to find where the actual code starts
+    if (!cleanCode.trim().startsWith('import')) {
+      const importMatch = cleanCode.match(/import\s+(?:React|{)/);
+      if (importMatch) {
+        cleanCode = cleanCode.substring(cleanCode.indexOf(importMatch[0]));
+      }
+    }
+
+    console.log(`[${jobId}] Generated ${cleanCode.length} characters of Remotion code`);
+    console.log(`[${jobId}] === REMOTION GENERATOR COMPLETE ===\n`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      code: cleanCode,
+      prompt: prompt,
+    }));
+
+  } catch (error) {
+    console.error('Remotion code generation error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Standalone Remotion generator (no session required)
+async function handleGenerateRemotionStandalone(req, res) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' }));
+    return;
+  }
+
+  try {
+    const body = await parseBody(req);
+    const { prompt } = body;
+
+    if (!prompt) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'prompt is required' }));
+      return;
+    }
+
+    const jobId = randomUUID().substring(0, 8);
+    console.log(`\n[${jobId}] === REMOTION CODE GENERATOR (STANDALONE) ===`);
+    console.log(`[${jobId}] User prompt: ${prompt.substring(0, 200)}...`);
+
+    const ai = new GoogleGenAI({ apiKey });
+
+    const systemPrompt = `You are a Remotion code generator. Output ONLY TypeScript/TSX code with NO explanations, NO markdown, NO prose.
+
+CRITICAL RULES:
+- Output ONLY raw TypeScript/TSX code
+- Do NOT use markdown code blocks (\`\`\`)
+- Do NOT include any explanations or comments outside the code
+- Start directly with "import" statement
+- End with the config export
+
+REQUIRED STRUCTURE:
+1. Import from 'remotion': useCurrentFrame, useVideoConfig, interpolate, spring, Sequence, Easing, AbsoluteFill
+2. Import React
+3. Define main component with animations
+4. Export config object with id, component, durationInFrames, fps, width, height
+
+ANIMATION APIs:
+- interpolate(frame, [start, end], [valueStart, valueEnd], { easing })
+- spring({ frame, fps, config: { damping, stiffness } })
+- Sequence from/durationInFrames for timing
+- AbsoluteFill for full-frame containers
+- Easing.out, Easing.inOut, Easing.bezier() for smooth motion
+
+DEFAULT CONFIG (if not specified):
+- width: 1920, height: 1080, fps: 30, durationInFrames: 240 (8 seconds)
+
+OUTPUT EXACTLY THIS FORMAT:
+import React from 'react';
+import { useCurrentFrame, useVideoConfig, interpolate, spring, AbsoluteFill, Sequence, Easing } from 'remotion';
+
+export const MyComposition: React.FC = () => {
+  const frame = useCurrentFrame();
+  const { fps, width, height } = useVideoConfig();
+
+  // Your animation code here
+
+  return (
+    <AbsoluteFill style={{ backgroundColor: '#000' }}>
+      {/* Animated elements */}
+    </AbsoluteFill>
+  );
+};
+
+export const myCompositionConfig = {
+  id: 'MyComposition',
+  component: MyComposition,
+  durationInFrames: 240,
+  fps: 30,
+  width: 1920,
+  height: 1080,
+};`;
+
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{
+        role: 'user',
+        parts: [{ text: `Generate a single, complete Remotion composition TSX file for the following request. Output ONLY the raw TypeScript code, starting with "import React" and ending with the config export object. Do NOT include any markdown formatting, code blocks, explanations, setup instructions, or prose. Just the code.\n\nRequest: ${prompt}` }]
+      }],
+      systemInstruction: systemPrompt,
+    });
+
+    const generatedCode = result.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+
+    if (!generatedCode || generatedCode.length < 50) {
+      throw new Error('Failed to generate valid Remotion code');
+    }
+
+    // Extract code from markdown blocks if present
+    let cleanCode = generatedCode;
+    const codeBlockMatch = generatedCode.match(/```(?:tsx?|typescript|javascript)?\s*\n([\s\S]*?)```/g);
+    if (codeBlockMatch && codeBlockMatch.length > 0) {
+      const blocks = codeBlockMatch.map(block =>
+        block.replace(/^```(?:tsx?|typescript|javascript)?\s*\n?/, '').replace(/\n?```$/, '')
+      );
+      cleanCode = blocks.reduce((a, b) => a.length > b.length ? a : b);
+    } else if (cleanCode.startsWith('```')) {
+      cleanCode = cleanCode.replace(/^```(?:tsx?|typescript|javascript)?\s*\n?/, '').replace(/\n?```$/, '');
+    }
+
+    if (!cleanCode.trim().startsWith('import')) {
+      const importMatch = cleanCode.match(/import\s+(?:React|{)/);
+      if (importMatch) {
+        cleanCode = cleanCode.substring(cleanCode.indexOf(importMatch[0]));
+      }
+    }
+
+    console.log(`[${jobId}] Generated ${cleanCode.length} characters of Remotion code`);
+    console.log(`[${jobId}] === REMOTION GENERATOR COMPLETE ===\n`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      code: cleanCode,
+      prompt: prompt,
+    }));
+
+  } catch (error) {
+    console.error('Remotion code generation error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Render Remotion animation from prompt (uses DynamicAnimation with scene props)
+async function handleRenderRemotion(req, res, sessionId) {
+  const session = sessionId ? getSession(sessionId) : null;
+
+  try {
+    const body = await parseBody(req);
+    const { prompt, width = 1920, height = 1080, fps = 30, durationSeconds = 8, images = [] } = body;
+
+    if (!prompt) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'prompt is required' }));
+      return;
+    }
+
+    // Check for Gemini API
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (!geminiKey) {
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' }));
+      return;
+    }
+
+    const jobId = randomUUID().substring(0, 8);
+    console.log(`\n[${jobId}] === REMOTION RENDER FROM PROMPT ===`);
+    console.log(`[${jobId}] Rendering ${width}x${height} @ ${fps}fps, ${durationSeconds}s`);
+    console.log(`[${jobId}] Prompt: ${prompt.substring(0, 100)}...`);
+    if (images && images.length > 0) {
+      console.log(`[${jobId}] 🖼️ ${images.length} user images provided`);
+    }
+
+    const startTime = Date.now();
+
+    // Step 1: Generate scene data using Gemini (same approach as handleGenerateAnimation)
+    console.log(`[${jobId}] Generating scene data with Gemini...`);
+
+    const ai = new GoogleGenAI({ apiKey: geminiKey });
+
+    const targetFrames = Math.round(durationSeconds * fps);
+
+    // Build images section for prompt if user provided images
+    // Use placeholders instead of actual URLs to prevent Gemini from mistyping UUIDs
+    const imageUrlMap = {};
+    const imagesSection = images && images.length > 0
+      ? `\n\n⚠️ CRITICAL - USER HAS PROVIDED ${images.length} IMAGE(S) TO USE:
+${images.map((img, i) => {
+  const placeholder = `{{IMAGE_${i + 1}}}`;
+  imageUrlMap[placeholder] = img.url;
+  return `  Image ${i + 1}: "${img.filename}" → mediaPath: "${placeholder}"`;
+}).join('\n')}
+
+🎯 THE USER'S IMAGE(S) ARE THE MAIN VISUAL ELEMENT!
+
+⚠️ WHEN USER PROVIDES IMAGES: CREATE EXACTLY ONE "media" SCENE - NO INTRO, NO OUTRO, NO EXTRAS!
+The user uploaded their image for a reason - they want THAT image displayed with effects, NOT a bunch of generic scenes.
+
+Follow these rules:
+1. Create a SINGLE "media" scene that displays the user's image FULLSCREEN
+2. Use mediaStyle: "fullscreen" - the image IS the entire video
+3. Apply any text the user wants via overlayText ON TOP of the image
+4. Apply any effects the user wants via mediaAnimation (pulse, glow, ken-burns, etc.)
+5. The user's image IS whatever they're referring to (box, frame, background, etc.)
+6. DO NOT add intro scenes, outro scenes, emoji scenes, or "variety" - JUST THE USER'S IMAGE WITH THEIR REQUESTED EFFECTS
+7. Duration: Use ALL ${durationSeconds} seconds for this ONE scene
+
+Example media scene with overlay text:
+{"id": "main", "type": "media", "duration": 240, "content": {
+  "mediaPath": "{{IMAGE_1}}",
+  "mediaType": "image",
+  "mediaStyle": "fullscreen",
+  "overlayText": "SUBSCRIBE",
+  "overlayPosition": "center",
+  "overlayStyle": "bold",
+  "mediaAnimation": {"type": "pulse", "intensity": 0.3},
+  "camera": {"type": "zoom-in", "intensity": 0.2}
+}, "transition": {"type": "fade"}}`
+      : '';
+
+    const scenePrompt = `You are an expert motion graphics designer. Create a visually stunning animation by generating scene data JSON.
+
+USER REQUEST: ${prompt}${imagesSection}
+
+OUTPUT FORMAT - Return ONLY valid JSON with this structure:
+{
+  "scenes": [...],
+  "backgroundColor": "#0a0a0a",
+  "totalDuration": ${targetFrames}
+}
+
+SCENE TYPES (only use what the user asks for):
+
+1. "title" - Big animated text
+   {"id": "intro", "type": "title", "duration": 60, "content": {"title": "MAIN TEXT", "subtitle": "smaller text", "color": "#f97316"}, "transition": {"type": "zoom-in", "duration": 15}}
+
+2. "emoji" - Animated emoji characters (only if user specifically asks for emojis)
+   {"id": "emojis", "type": "emoji", "duration": 45, "content": {"emojis": [
+     {"emoji": "🔥", "x": 25, "y": 40, "scale": 0.25, "animation": "bounce"},
+     {"emoji": "⭐", "x": 50, "y": 30, "scale": 0.2, "animation": "spin"},
+     {"emoji": "🚀", "x": 75, "y": 50, "scale": 0.3, "animation": "float"}
+   ], "emojiLayout": "custom"}, "transition": {"type": "swipe-left"}}
+
+3. "shapes" - Animated geometric shapes (circles, stars, triangles)
+   {"id": "shapes", "type": "shapes", "duration": 60, "content": {"shapes": [
+     {"type": "star", "fill": "#f97316", "x": 50, "y": 50, "scale": 1.5, "animation": "spin", "points": 5},
+     {"type": "circle", "fill": "#3b82f6", "x": 30, "y": 60, "scale": 0.8, "animation": "pulse"},
+     {"type": "triangle", "fill": "#22c55e", "x": 70, "y": 40, "scale": 1, "animation": "bounce"}
+   ], "shapesLayout": "custom"}, "transition": {"type": "fade"}}
+
+4. "stats" - Animated counting numbers (MUST include numericValue as INTEGER!)
+   {"id": "stats", "type": "stats", "duration": 90, "content": {"stats": [
+     {"value": "10K+", "label": "Subscribers", "numericValue": 10000, "suffix": "+"},
+     {"value": "$50K", "label": "Revenue", "numericValue": 50000, "prefix": "$"},
+     {"value": "99%", "label": "Satisfaction", "numericValue": 99, "suffix": "%"}
+   ], "color": "#8b5cf6"}, "transition": {"type": "swipe-right"}}
+
+5. "countdown" - Animated countdown timer
+   {"id": "countdown", "type": "countdown", "duration": 120, "content": {"countFrom": 5, "countTo": 0, "color": "#ec4899"}}
+
+6. "steps" or "features" - List with icons
+   {"id": "steps", "type": "steps", "duration": 90, "content": {"items": [
+     {"icon": "1", "label": "First Step", "description": "Do this first"},
+     {"icon": "2", "label": "Second Step", "description": "Then do this"},
+     {"icon": "3", "label": "Final Step", "description": "Complete!"}
+   ], "color": "#22c55e"}, "transition": {"type": "swipe-up"}}
+
+7. "chart" - Data visualization
+   {"id": "chart", "type": "chart", "duration": 90, "content": {"chartType": "bar", "chartData": [
+     {"label": "Jan", "value": 65, "color": "#3b82f6"},
+     {"label": "Feb", "value": 80, "color": "#22c55e"},
+     {"label": "Mar", "value": 95, "color": "#f97316"}
+   ], "maxValue": 100}, "transition": {"type": "fade"}}
+
+8. "comparison" - Before/After
+   {"id": "compare", "type": "comparison", "duration": 75, "content": {"beforeLabel": "BEFORE", "afterLabel": "AFTER", "beforeValue": "50%", "afterValue": "99%"}}
+
+9. "text" - Simple text message
+   {"id": "cta", "type": "text", "duration": 45, "content": {"title": "Click the link below!", "color": "#f97316"}}
+
+10. "gif" - Animated GIF from GIPHY (auto-fetched by search term!)
+   {"id": "reaction", "type": "gif", "duration": 60, "content": {"gifSearch": "mind blown", "gifLayout": "fullscreen"}, "transition": {"type": "zoom-in"}}
+   Popular searches: "celebration", "mind blown", "excited", "thumbs up", "fire", "applause", "wow", "success", "dancing"
+
+11. "media" - Animated image/photo with cinematic effects (USE WHEN USER PROVIDES IMAGES!)
+   {"id": "photo1", "type": "media", "duration": 90, "content": {
+     "mediaPath": "IMAGE_URL_HERE",
+     "mediaType": "image",
+     "mediaStyle": "fullscreen",
+     "mediaAnimation": {"type": "ken-burns", "intensity": 0.4},
+     "overlayText": "Optional text overlay",
+     "overlayPosition": "bottom",
+     "camera": {"type": "zoom-in", "intensity": 0.2}
+   }, "transition": {"type": "fade"}}
+   Media styles: "fullscreen", "framed", "circle", "phone-frame", "split-left", "split-right"
+   Media animations: "ken-burns" (slow zoom+pan), "zoom-in", "zoom-out", "pan-left", "pan-right", "rotate", "parallax"
+
+CAMERA MOVEMENTS (add to content for dynamic feel):
+- "camera": {"type": "zoom-in", "intensity": 0.3} - Dramatic focus
+- "camera": {"type": "zoom-out", "intensity": 0.25} - Reveal effect
+- "camera": {"type": "ken-burns", "intensity": 0.3} - Cinematic slow zoom+pan
+- "camera": {"type": "pan-left", "intensity": 0.2} - Horizontal movement
+- "camera": {"type": "shake", "intensity": 0.15} - Energy/impact
+
+TRANSITIONS (between scenes - REQUIRED for professional look!):
+- "swipe-left", "swipe-right", "swipe-up", "swipe-down" - Dynamic slides (most common)
+- "fade" - Smooth crossfade (elegant, professional)
+- "wipe-left", "wipe-right" - Reveal effect (dramatic)
+- "flip" - 3D rotation (attention-grabbing)
+- "clock" - Circular clock wipe (unique, engaging)
+- "zoom-in", "zoom-out" - Scale transitions (impact)
+
+EMOJI ANIMATIONS: "pop", "bounce", "float", "pulse", "spin", "shake", "wave"
+SHAPE ANIMATIONS: "pop", "spin", "bounce", "float", "pulse"
+SHAPE TYPES: "circle", "rect", "star", "triangle", "polygon", "ellipse"
+
+VIBRANT COLORS: #f97316 (orange), #3b82f6 (blue), #22c55e (green), #8b5cf6 (purple), #ec4899 (pink), #eab308 (yellow), #ef4444 (red), #06b6d4 (cyan)
+
+CRITICAL RULES:
+1. Target duration: EXACTLY ${durationSeconds} seconds = ${targetFrames} frames at ${fps}fps
+2. ⚠️ ONLY CREATE SCENES THE USER EXPLICITLY ASKS FOR - NO EXTRAS!
+3. If user provides images: Create ONE "media" scene showing their image fullscreen with requested effects
+4. DO NOT add intro scenes, outro scenes, emoji scenes, CTAs, or "variety" scenes unless specifically requested
+5. The user's prompt is the EXACT specification - fulfill it literally, nothing more
+6. For stats: numericValue MUST be an integer (10000 not "10000")
+7. If user asks for text on their image: ONE media scene with overlayText property
+8. If user asks for effects on their image: Apply via mediaAnimation property (pulse, glow, ken-burns, etc.)
+9. Transitions are only needed if you have MULTIPLE scenes (which you shouldn't unless user asked for them)
+10. When in doubt: SIMPLER IS BETTER. One scene that does exactly what was asked beats 8 scenes with fluff
+
+Return ONLY the JSON object, no markdown code blocks or explanation.`;
+
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{ role: 'user', parts: [{ text: scenePrompt }] }],
+    });
+
+    let sceneData;
+    try {
+      const responseText = result.candidates[0].content.parts[0].text;
+      const cleanedResponse = responseText
+        .replace(/```json\n?/g, '')
+        .replace(/```\n?/g, '')
+        .trim();
+      sceneData = JSON.parse(cleanedResponse);
+    } catch (parseError) {
+      console.error(`[${jobId}] Failed to parse Gemini response:`, parseError);
+      throw new Error('Failed to parse AI-generated scene data');
+    }
+
+    console.log(`[${jobId}] Generated ${sceneData.scenes.length} scenes`);
+
+    // Replace image placeholders with actual URLs
+    if (Object.keys(imageUrlMap).length > 0) {
+      console.log(`[${jobId}] Replacing ${Object.keys(imageUrlMap).length} image placeholders with URLs`);
+      let sceneDataStr = JSON.stringify(sceneData);
+      for (const [placeholder, url] of Object.entries(imageUrlMap)) {
+        sceneDataStr = sceneDataStr.split(placeholder).join(url);
+      }
+      sceneData = JSON.parse(sceneDataStr);
+    }
+
+    // Ensure totalDuration matches target
+    let totalDuration = sceneData.scenes.reduce((sum, s) => sum + (s.duration || 60), 0);
+    if (totalDuration !== targetFrames && totalDuration > 0) {
+      const scale = targetFrames / totalDuration;
+      for (const scene of sceneData.scenes) {
+        scene.duration = Math.max(1, Math.round(scene.duration * scale));
+      }
+      totalDuration = sceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
+      sceneData.totalDuration = totalDuration;
+    }
+
+    // Post-process GIF scenes - search GIPHY and inject actual URLs
+    const giphyKey = process.env.GIPHY_API_KEY;
+    for (const scene of sceneData.scenes) {
+      if (scene.type === 'gif' && scene.content) {
+        const { gifSearch, gifSearches } = scene.content;
+        const searchTerms = gifSearches || (gifSearch ? [gifSearch] : []);
+
+        if (searchTerms.length > 0 && giphyKey) {
+          console.log(`[${jobId}] 🎬 Fetching GIFs for: ${searchTerms.join(', ')}`);
+          scene.content.gifs = [];
+
+          for (const term of searchTerms) {
+            try {
+              const gifs = await searchGiphy(term, 1);
+              if (gifs.length > 0) {
+                const gif = gifs[0];
+                const gifUrl = gif.images?.fixed_height?.url || gif.images?.original?.url;
+                if (gifUrl) {
+                  scene.content.gifs.push({
+                    src: gifUrl,
+                    width: parseInt(gif.images?.fixed_height?.width) || 400,
+                    height: parseInt(gif.images?.fixed_height?.height) || 300,
+                    animation: 'pop',
+                  });
+                  console.log(`[${jobId}]    ✓ Found GIF for "${term}"`);
+                }
+              }
+            } catch (err) {
+              console.log(`[${jobId}]    ✗ GIPHY search failed for "${term}"`);
+            }
+          }
+
+          if (!scene.content.gifLayout && scene.content.gifs.length === 1) {
+            scene.content.gifLayout = 'fullscreen';
+          } else if (!scene.content.gifLayout) {
+            scene.content.gifLayout = 'scattered';
+          }
+        }
+      }
+    }
+
+    // Step 2: Write props to JSON file
+    const propsDir = session ? session.dir : join(TEMP_DIR, 'remotion-render', jobId);
+    mkdirSync(propsDir, { recursive: true });
+
+    const propsPath = join(propsDir, `remotion-props-${jobId}.json`);
+    const outputPath = join(propsDir, `remotion-output-${jobId}.mp4`);
+    const thumbPath = join(propsDir, `remotion-thumb-${jobId}.jpg`);
+
+    writeFileSync(propsPath, JSON.stringify(sceneData, null, 2));
+    console.log(`[${jobId}] Props written to ${propsPath}`);
+
+    // Step 3: Render with Remotion CLI using DynamicAnimation (the working approach)
+    console.log(`[${jobId}] Rendering with Remotion...`);
+
+    const remotionArgs = [
+      'remotion', 'render',
+      'src/remotion/index.tsx',
+      'DynamicAnimation',
+      outputPath,
+      '--props', propsPath,
+      '--frames', `0-${totalDuration - 1}`,
+      '--fps', String(fps),
+      '--width', String(width),
+      '--height', String(height),
+      '--codec', 'h264',
+      '--overwrite',
+      '--gl=angle',
+    ];
+
+    await new Promise((resolve, reject) => {
+      const proc = spawn(NPX_CMD, remotionArgs, {
+        cwd: process.cwd(),
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: process.platform === 'win32',
+      });
+
+      let stderr = '';
+      proc.stderr.on('data', (data) => {
+        stderr += data.toString();
+        console.log(`[${jobId}] Remotion: ${data.toString().trim()}`);
+      });
+
+      proc.on('close', (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`Remotion render failed with code ${code}: ${stderr}`));
+        }
+      });
+
+      proc.on('error', (err) => {
+        reject(new Error(`Failed to start Remotion: ${err.message}`));
+      });
+    });
+
+    const renderTime = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[${jobId}] Render complete in ${renderTime}s`);
+
+    // Check if output exists
+    if (!existsSync(outputPath)) {
+      throw new Error('Render completed but output file not found');
+    }
+
+    // Generate thumbnail
+    try {
+      await runFFmpeg([
+        '-y', '-i', outputPath,
+        '-vf', 'scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2',
+        '-frames:v', '1',
+        thumbPath
+      ], jobId);
+    } catch (e) {
+      console.warn(`[${jobId}] Thumbnail generation failed:`, e.message);
+    }
+
+    // Clean up props file
+    try {
+      unlinkSync(propsPath);
+    } catch (e) {}
+
+    // If we have a session, save as asset
+    if (session) {
+      const assetId = randomUUID();
+      const assetPath = join(session.assetsDir, `${assetId}.mp4`);
+      const assetThumbPath = join(session.assetsDir, `${assetId}_thumb.jpg`);
+
+      // Copy to session assets
+      const fs = await import('fs/promises');
+      await fs.copyFile(outputPath, assetPath);
+      if (existsSync(thumbPath)) {
+        await fs.copyFile(thumbPath, assetThumbPath);
+      }
+
+      const stats = await fs.stat(assetPath);
+      const durationInSeconds = totalDuration / fps;
+
+      const asset = {
+        id: assetId,
+        type: 'video',
+        filename: `remotion-animation-${Date.now()}.mp4`,
+        path: assetPath,
+        thumbPath: existsSync(assetThumbPath) ? assetThumbPath : null,
+        duration: durationInSeconds,
+        size: stats.size,
+        width,
+        height,
+        fps,
+        createdAt: Date.now(),
+        aiGenerated: true,
+        generatedBy: 'remotion-prompt',
+      };
+
+      session.assets.set(assetId, asset);
+      saveAssetMetadata(session);
+
+      console.log(`[${jobId}] Saved asset: ${asset.filename} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
+      console.log(`[${jobId}] === REMOTION RENDER COMPLETE ===\n`);
+
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({
+        success: true,
+        asset: {
+          id: assetId,
+          filename: asset.filename,
+          duration: durationInSeconds,
+          width,
+          height,
+          thumbnailUrl: `/session/${sessionId}/assets/${assetId}/thumbnail`,
+          streamUrl: `/session/${sessionId}/assets/${assetId}/stream`,
+        },
+        renderTime: parseFloat(renderTime),
+        sceneCount: sceneData.scenes.length,
+      }));
+    } else {
+      // No session - return the video as a download
+      const videoData = readFileSync(outputPath);
+      const durationInSeconds = totalDuration / fps;
+      res.writeHead(200, {
+        'Content-Type': 'video/mp4',
+        'Content-Disposition': `attachment; filename="remotion-animation-${jobId}.mp4"`,
+        'Content-Length': videoData.length,
+        'Access-Control-Allow-Origin': '*'
+      });
+      res.end(videoData);
+
+      // Cleanup temp files
+      try {
+        unlinkSync(outputPath);
+        if (existsSync(thumbPath)) unlinkSync(thumbPath);
+      } catch (e) {}
+    }
+
+    console.log(`[${jobId}] === REMOTION RENDER FROM PROMPT COMPLETE ===\n`);
+
+  } catch (error) {
+    console.error('Remotion render error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
 // Extract audio from video - creates separate audio asset and mutes the video
 async function handleExtractAudio(req, res, sessionId) {
   const session = getSession(sessionId);
@@ -10826,6 +11565,14 @@ const server = http.createServer(async (req, res) => {
     else if (req.method === 'POST' && action === 'remove-video-bg') {
       await handleRemoveVideoBg(req, res, sessionId);
     }
+    // Generate Remotion composition code from prompt
+    else if (req.method === 'POST' && action === 'generate-remotion') {
+      await handleGenerateRemotion(req, res, sessionId);
+    }
+    // Render Remotion code to video asset
+    else if (req.method === 'POST' && action === 'render-remotion') {
+      await handleRenderRemotion(req, res, sessionId);
+    }
     // GIPHY search endpoints
     else if (req.method === 'GET' && action === 'giphy/search') {
       await handleGiphySearch(req, res, sessionId, url);
@@ -10849,6 +11596,18 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Session endpoint not found' }));
     }
+    return;
+  }
+
+  // Standalone Remotion generator (no session required)
+  if (req.method === 'POST' && path === '/generate-remotion') {
+    await handleGenerateRemotionStandalone(req, res);
+    return;
+  }
+
+  // Standalone Remotion renderer (no session required - returns video download)
+  if (req.method === 'POST' && path === '/render-remotion') {
+    await handleRenderRemotion(req, res, null);
     return;
   }
 

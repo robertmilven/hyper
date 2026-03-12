@@ -30,7 +30,8 @@ import { useViralEdit } from '@/react-app/hooks/useViralEdit';
 import ViralEditPanel from '@/react-app/components/ViralEditPanel';
 import { useContentRepurpose } from '@/react-app/hooks/useContentRepurpose';
 import ContentRepurposePanel from '@/react-app/components/ContentRepurposePanel';
-import { Image, Camera, Zap, Scissors } from 'lucide-react';
+import RemotionGeneratorPanel from '@/react-app/components/RemotionGeneratorPanel';
+import { Image, Camera, Zap, Scissors, Code } from 'lucide-react';
 import type { FrameTemplate } from '@/react-app/hooks/useProject';
 import type { TemplateId } from '@/remotion/templates';
 
@@ -60,6 +61,7 @@ export default function Home() {
   const [showBrollPanel, setShowBrollPanel] = useState(false);
   const [showViralPanel, setShowViralPanel] = useState(false);
   const [showRepurposePanel, setShowRepurposePanel] = useState(false);
+  const [showRemotionPanel, setShowRemotionPanel] = useState(false);
 
   // Frame template for 9:16 vertical video styling
   const { templates: frameTemplates, saveTemplate: saveFrameTemplate, deleteTemplate: deleteFrameTemplate } = useFrameTemplates();
@@ -2427,6 +2429,13 @@ export default function Home() {
             <Scissors className="w-4 h-4 text-zinc-600 dark:text-zinc-400" />
           </button>
           <button
+            onClick={() => setShowRemotionPanel(true)}
+            className="p-2 bg-gradient-to-r from-purple-500/20 to-pink-500/20 hover:from-purple-500/30 hover:to-pink-500/30 rounded-lg transition-colors border border-purple-500/30"
+            title="Remotion Generator"
+          >
+            <Code className="w-4 h-4 text-purple-400" />
+          </button>
+          <button
             onClick={() => setShowKeyboardShortcuts(true)}
             className="p-2 bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700 rounded-lg transition-colors"
             title="Keyboard Shortcuts (?)"
@@ -2946,6 +2955,15 @@ export default function Home() {
           onDownloadAll={contentRepurpose.downloadAll}
           onClear={contentRepurpose.clear}
           onClose={() => setShowRepurposePanel(false)}
+        />
+      )}
+
+      {/* Remotion Generator Panel */}
+      {showRemotionPanel && (
+        <RemotionGeneratorPanel
+          onClose={() => setShowRemotionPanel(false)}
+          sessionId={session?.id}
+          onAssetCreated={refreshAssets}
         />
       )}
 
