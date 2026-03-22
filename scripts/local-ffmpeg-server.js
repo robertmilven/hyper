@@ -1893,6 +1893,132 @@ async function handleAssetThumbnail(req, res, sessionId, assetId) {
   createReadStream(asset.thumbPath).pipe(res);
 }
 
+// Get audio waveform data for asset
+async function handleAssetWaveform(req, res, sessionId, assetId, url) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const asset = session.assets.get(assetId);
+  if (!asset || !existsSync(asset.path)) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Asset not found' }));
+    return;
+  }
+
+  // Only process audio or video assets
+  if (asset.type !== 'audio' && asset.type !== 'video') {
+    res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Asset must be audio or video' }));
+    return;
+  }
+
+  // Check for cached waveform
+  const waveformPath = join(session.assetsDir, `${assetId}_waveform.json`);
+  if (existsSync(waveformPath)) {
+    try {
+      const cached = JSON.parse(readFileSync(waveformPath, 'utf-8'));
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify(cached));
+      return;
+    } catch (e) {
+      // Cache invalid, regenerate
+    }
+  }
+
+  // Get number of samples from query param (default 200)
+  const numSamples = Math.min(Math.max(parseInt(url.searchParams.get('samples') || '200'), 50), 1000);
+
+  try {
+    console.log(`[${sessionId}] Generating waveform for asset ${assetId}...`);
+
+    // Use ffmpeg to extract audio samples
+    // -af "aformat=channel_layouts=mono,compand" normalizes audio
+    // -f data outputs raw audio samples
+    const ffprobeCmd = `ffprobe -v error -select_streams a:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 "${asset.path}"`;
+
+    let audioDuration = 0;
+    try {
+      const durationResult = execSync(ffprobeCmd, { encoding: 'utf-8' });
+      audioDuration = parseFloat(durationResult.trim()) || asset.duration || 10;
+    } catch {
+      audioDuration = asset.duration || 10;
+    }
+
+    // Calculate samples per segment
+    const segmentDuration = audioDuration / numSamples;
+
+    // Use ffmpeg to get peak values for each segment
+    // This creates a temp file with audio samples, then we analyze it
+    const tempPcmPath = join(session.assetsDir, `${assetId}_temp.raw`);
+
+    // Extract audio as raw PCM mono 8-bit, downsampled to 8000Hz for efficiency
+    const ffmpegCmd = `ffmpeg -y -i "${asset.path}" -ac 1 -ar 8000 -f u8 "${tempPcmPath}"`;
+
+    try {
+      execSync(ffmpegCmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) {
+      // FFmpeg outputs to stderr even on success, ignore
+    }
+
+    if (!existsSync(tempPcmPath)) {
+      throw new Error('Failed to extract audio data');
+    }
+
+    // Read raw audio and compute RMS values for each segment
+    const rawAudio = readFileSync(tempPcmPath);
+    const totalSamples = rawAudio.length;
+    const samplesPerSegment = Math.floor(totalSamples / numSamples);
+
+    const waveformData = [];
+
+    for (let i = 0; i < numSamples; i++) {
+      const start = i * samplesPerSegment;
+      const end = Math.min(start + samplesPerSegment, totalSamples);
+
+      // Calculate RMS (root mean square) for this segment
+      let sumSquares = 0;
+      for (let j = start; j < end; j++) {
+        // Convert unsigned 8-bit (0-255) to signed (-128 to 127), then normalize to -1 to 1
+        const sample = (rawAudio[j] - 128) / 128;
+        sumSquares += sample * sample;
+      }
+      const rms = Math.sqrt(sumSquares / (end - start || 1));
+
+      // Normalize to 0-1 range and apply slight curve for better visualization
+      const normalized = Math.min(1, rms * 2.5);
+      waveformData.push(Math.round(normalized * 1000) / 1000);
+    }
+
+    // Clean up temp file
+    try {
+      unlinkSync(tempPcmPath);
+    } catch {}
+
+    const result = {
+      assetId,
+      duration: audioDuration,
+      samples: waveformData,
+      sampleCount: numSamples,
+    };
+
+    // Cache the result
+    writeFileSync(waveformPath, JSON.stringify(result));
+
+    console.log(`[${sessionId}] Waveform generated: ${numSamples} samples`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify(result));
+  } catch (error) {
+    console.error(`[${sessionId}] Waveform generation failed:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
 // Stream asset
 async function handleAssetStream(req, res, sessionId, assetId) {
   const session = getSession(sessionId);
@@ -11381,6 +11507,8 @@ const server = http.createServer(async (req, res) => {
         await handleAssetThumbnail(req, res, sessionId, assetId);
       } else if (req.method === 'GET' && subAction === 'stream') {
         await handleAssetStream(req, res, sessionId, assetId);
+      } else if (req.method === 'GET' && subAction === 'waveform') {
+        await handleAssetWaveform(req, res, sessionId, assetId, url);
       } else if (req.method === 'GET' && !subAction && (assetId.endsWith('.jpg') || assetId.endsWith('.png'))) {
         // Serve static image files from assets directory (e.g., scene thumbnails)
         const session = getSession(sessionId);

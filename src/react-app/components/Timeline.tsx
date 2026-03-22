@@ -12,6 +12,7 @@ interface TimelineProps {
   duration: number;
   isPlaying: boolean;
   aspectRatio: '16:9' | '9:16';
+  sessionId?: string;  // For audio waveform fetching
   onSelectClip: (id: string | null) => void;
   onTimeChange: (time: number) => void;
   onPlayPause: () => void;
@@ -58,6 +59,7 @@ export default function Timeline({
   duration,
   isPlaying,
   aspectRatio,
+  sessionId,
   onSelectClip,
   onTimeChange,
   onPlayPause,
@@ -586,6 +588,7 @@ export default function Timeline({
                           pixelsPerSecond={pixelsPerSecond}
                           isSelected={selectedClipId === clip.id}
                           trackHeight={TRACK_HEIGHTS[track.type]}
+                          sessionId={sessionId}
                           onClick={() => onSelectClip(clip.id)}
                           onMove={(newStart) => onMoveClip(clip.id, newStart)}
                           onResize={(inPoint, outPoint, newStart) =>

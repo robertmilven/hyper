@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
-import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move, Star, Globe, ZoomIn, Maximize2, RotateCcw, Waves, Sun, Palette, Layers, Camera, Aperture, Sliders } from 'lucide-react';
+import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move, Star, Globe, ZoomIn, Maximize2, RotateCcw, Waves, Sun, Palette, Layers, Camera, Aperture, Sliders, Eraser } from 'lucide-react';
 import type { TimelineClip, Track, Asset, CaptionData, CaptionWord } from '@/react-app/hooks/useProject';
 import { MOTION_TEMPLATES, type TemplateId } from '@/remotion/templates';
 import MotionGraphicsPanel from './MotionGraphicsPanel';
@@ -969,6 +969,24 @@ export default function AIPromptPanel({
         { icon: Type, text: 'Translate captions to Spanish' },
         { icon: Music, text: 'Duck background music under speech' },
         { icon: Type, text: 'Export captions as SRT file' },
+      ],
+    },
+    {
+      label: 'Image Generation (Picasso)',
+      items: [
+        { icon: ImagePlus, text: 'Generate a landscape background' },
+        { icon: ImagePlus, text: 'Create a square thumbnail' },
+        { icon: ImagePlus, text: 'Design a vertical poster' },
+        { icon: Sparkles, text: 'Create an abstract pattern' },
+      ],
+    },
+    {
+      label: 'Video Effects (DiCaprio)',
+      items: [
+        { icon: Film, text: 'Animate image with slow zoom' },
+        { icon: Wand2, text: 'Apply cinematic film style to video' },
+        { icon: Eraser, text: 'Remove video background' },
+        { icon: Film, text: 'Add camera movement to image' },
       ],
     },
   ];

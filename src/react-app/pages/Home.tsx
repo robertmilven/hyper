@@ -5,8 +5,6 @@ import AssetLibrary from '@/react-app/components/AssetLibrary';
 import ClipPropertiesPanel from '@/react-app/components/ClipPropertiesPanel';
 import CaptionPropertiesPanel from '@/react-app/components/CaptionPropertiesPanel';
 import AIPromptPanel from '@/react-app/components/AIPromptPanel';
-import PicassoPanel from '@/react-app/components/PicassoPanel';
-import DiCaprioPanel from '@/react-app/components/DiCaprioPanel';
 import GifSearchPanel from '@/react-app/components/GifSearchPanel';
 import ResizablePanel from '@/react-app/components/ResizablePanel';
 import ResizableVerticalPanel from '@/react-app/components/ResizableVerticalPanel';
@@ -31,6 +29,9 @@ import ViralEditPanel from '@/react-app/components/ViralEditPanel';
 import { useContentRepurpose } from '@/react-app/hooks/useContentRepurpose';
 import ContentRepurposePanel from '@/react-app/components/ContentRepurposePanel';
 import RemotionGeneratorPanel from '@/react-app/components/RemotionGeneratorPanel';
+import AIToolsDropdown from '@/react-app/components/AIToolsDropdown';
+import CommandBar from '@/react-app/components/CommandBar';
+import ExportPresetsDropdown, { type ExportPreset } from '@/react-app/components/ExportPresetsDropdown';
 import { Image, Camera, Zap, Scissors, Code } from 'lucide-react';
 import type { FrameTemplate } from '@/react-app/hooks/useProject';
 import type { TemplateId } from '@/remotion/templates';
@@ -53,7 +54,6 @@ export default function Home() {
   const [previewAssetId, setPreviewAssetId] = useState<string | null>(null);
   const [aspectRatio, setAspectRatio] = useState<'16:9' | '9:16'>('16:9');
   const [autoSnap, setAutoSnap] = useState(true); // Ripple delete mode - shift clips when deleting
-  const [activeAgent, setActiveAgent] = useState<'director' | 'picasso' | 'dicaprio'>('director');
   const [showGifSearch, setShowGifSearch] = useState(false);
   const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false);
   const [showScenePanel, setShowScenePanel] = useState(false);
@@ -62,6 +62,7 @@ export default function Home() {
   const [showViralPanel, setShowViralPanel] = useState(false);
   const [showRepurposePanel, setShowRepurposePanel] = useState(false);
   const [showRemotionPanel, setShowRemotionPanel] = useState(false);
+  const [showCommandBar, setShowCommandBar] = useState(false);
 
   // Frame template for 9:16 vertical video styling
   const { templates: frameTemplates, saveTemplate: saveFrameTemplate, deleteTemplate: deleteFrameTemplate } = useFrameTemplates();
@@ -188,6 +189,18 @@ export default function Home() {
       loadProject();
     }
   }, [session, loadProject]);
+
+  // Command Bar keyboard listener (Cmd+K / Ctrl+K)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        setShowCommandBar(true);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   // Get all clips at the current playhead position as layers
   const getPreviewLayers = useCallback(() => {
@@ -2171,24 +2184,34 @@ export default function Home() {
     }
   }, [session, assets, addClip, saveProject, getDuration, refreshAssets]);
 
-  // Handle render/export
-  const handleExport = useCallback(async () => {
+  // Handle render/export with optional preset
+  const handleExport = useCallback(async (preset?: ExportPreset) => {
     if (clips.length === 0) {
       alert('Add some clips to the timeline first');
       return;
     }
 
     try {
-      // Determine the correct settings based on aspect ratio
-      const exportSettings = aspectRatio === '9:16'
-        ? { ...settings, width: 1080, height: 1920 }
-        : { ...settings, width: 1920, height: 1080 };
+      // Use preset settings if provided, otherwise determine from aspect ratio
+      let exportSettings;
+      let filename = 'export.mp4';
 
-      console.log('Exporting with settings:', exportSettings.width, 'x', exportSettings.height);
+      if (preset) {
+        exportSettings = { ...settings, width: preset.width, height: preset.height };
+        filename = `export-${preset.id}.mp4`;
+        console.log(`Exporting for ${preset.label}:`, preset.width, 'x', preset.height);
+      } else {
+        exportSettings = aspectRatio === '9:16'
+          ? { ...settings, width: 1080, height: 1920 }
+          : { ...settings, width: 1920, height: 1080 };
+        filename = aspectRatio === '9:16' ? 'export-vertical.mp4' : 'export.mp4';
+        console.log('Exporting with settings:', exportSettings.width, 'x', exportSettings.height);
+      }
 
-      // For 9:16 aspect ratio, include frame template and overlay assets
-      const frameTemplateForRender = aspectRatio === '9:16' ? currentFrameTemplate : null;
-      const overlayAssetsForRender = aspectRatio === '9:16'
+      // For 9:16 aspect ratio or vertical presets, include frame template and overlay assets
+      const isVertical = (preset && preset.aspectRatio === '9:16') || (!preset && aspectRatio === '9:16');
+      const frameTemplateForRender = isVertical ? currentFrameTemplate : null;
+      const overlayAssetsForRender = isVertical
         ? overlayAssets.map(a => ({ id: a.id, type: a.type, url: a.url }))
         : undefined;
 
@@ -2198,7 +2221,7 @@ export default function Home() {
       // Trigger download
       const link = document.createElement('a');
       link.href = downloadUrl;
-      link.download = aspectRatio === '9:16' ? 'export-vertical.mp4' : 'export.mp4';
+      link.download = filename;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -2207,6 +2230,29 @@ export default function Home() {
       alert(`Export failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }, [clips.length, renderProject, aspectRatio, currentFrameTemplate, overlayAssets, settings]);
+
+  // Handle Command Bar commands
+  const handleCommandBarCommand = useCallback((commandId: string) => {
+    // Panel commands
+    if (commandId === 'panel:scene') { setShowScenePanel(true); return; }
+    if (commandId === 'panel:broll') { setShowBrollPanel(true); return; }
+    if (commandId === 'panel:thumbnail') { setShowThumbnailPanel(true); return; }
+    if (commandId === 'panel:viral') { setShowViralPanel(true); return; }
+    if (commandId === 'panel:repurpose') { setShowRepurposePanel(true); return; }
+    if (commandId === 'panel:remotion') { setShowRemotionPanel(true); return; }
+
+    // Export commands - trigger export with preset settings
+    if (commandId.startsWith('export:')) {
+      // For now, just trigger the default export
+      // TODO: Implement preset-specific export
+      handleExport();
+      return;
+    }
+
+    // AI commands - route to Director panel and trigger action
+    // For now, just log - these will be integrated with Director
+    console.log('Command:', commandId);
+  }, [handleExport]);
 
   // Edit an existing animation with a new prompt
   const handleEditAnimation = useCallback(async (
@@ -2373,78 +2419,34 @@ export default function Home() {
                 Chapters
               </button>
               {clips.length > 0 && (
-                <button
-                  onClick={handleExport}
+                <ExportPresetsDropdown
+                  onExport={handleExport}
                   disabled={isProcessing}
-                  className="px-4 py-2 bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
-                >
-                  <Download className="w-4 h-4" />
-                  Export
-                </button>
+                />
               )}
             </>
           )}
-          <button
-            onClick={() => setShowScenePanel(!showScenePanel)}
-            className={`p-2 rounded-lg transition-colors ${
-              showScenePanel
-                ? 'bg-orange-500 text-white'
-                : 'bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700'
-            }`}
-            title="Smart Scene Detection"
-          >
-            <Layers className={`w-4 h-4 ${showScenePanel ? '' : 'text-zinc-600 dark:text-zinc-400'}`} />
-          </button>
-          {/* AI Feature Buttons */}
-          <button
-            onClick={() => setShowBrollPanel(!showBrollPanel)}
-            className={`p-2 rounded-lg transition-colors ${
-              showBrollPanel
-                ? 'bg-blue-500 text-white'
-                : 'bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700'
-            }`}
-            title="AI B-Roll Suggestions"
-          >
-            <Image className={`w-4 h-4 ${showBrollPanel ? '' : 'text-zinc-600 dark:text-zinc-400'}`} />
-          </button>
-          <button
-            onClick={() => setShowThumbnailPanel(true)}
-            className="p-2 bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700 rounded-lg transition-colors"
-            title="AI Thumbnail Generator"
-          >
-            <Camera className="w-4 h-4 text-zinc-600 dark:text-zinc-400" />
-          </button>
-          <button
-            onClick={() => setShowViralPanel(true)}
-            className="p-2 bg-gradient-to-r from-pink-500/20 to-purple-500/20 hover:from-pink-500/30 hover:to-purple-500/30 rounded-lg transition-colors border border-pink-500/30"
-            title="Make it Viral"
-          >
-            <Zap className="w-4 h-4 text-pink-400" />
-          </button>
-          <button
-            onClick={() => setShowRepurposePanel(true)}
-            className="p-2 bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700 rounded-lg transition-colors"
-            title="Content Repurposing (Shorts)"
-          >
-            <Scissors className="w-4 h-4 text-zinc-600 dark:text-zinc-400" />
-          </button>
-          <button
-            onClick={() => setShowRemotionPanel(true)}
-            className="p-2 bg-gradient-to-r from-purple-500/20 to-pink-500/20 hover:from-purple-500/30 hover:to-pink-500/30 rounded-lg transition-colors border border-purple-500/30"
-            title="Remotion Generator"
-          >
-            <Code className="w-4 h-4 text-purple-400" />
-          </button>
-          <button
-            onClick={() => setShowKeyboardShortcuts(true)}
-            className="p-2 bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700 rounded-lg transition-colors"
-            title="Keyboard Shortcuts (?)"
-          >
-            <HelpCircle className="w-4 h-4 text-zinc-600 dark:text-zinc-400" />
-          </button>
-          <button className="px-4 py-2 bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 rounded-lg text-sm font-medium text-white transition-all">
-            AI Edit
-          </button>
+          {/* AI Tools Dropdown - replaces 8 individual buttons */}
+          <AIToolsDropdown
+            onSelect={(toolId) => {
+              if (toolId === 'scene') setShowScenePanel(!showScenePanel);
+              else if (toolId === 'broll') setShowBrollPanel(!showBrollPanel);
+              else if (toolId === 'thumbnail') setShowThumbnailPanel(true);
+              else if (toolId === 'viral') setShowViralPanel(true);
+              else if (toolId === 'repurpose') setShowRepurposePanel(true);
+              else if (toolId === 'remotion') setShowRemotionPanel(true);
+              else if (toolId === 'shortcuts') setShowKeyboardShortcuts(true);
+            }}
+            activePanel={
+              showScenePanel ? 'scene' :
+              showBrollPanel ? 'broll' :
+              showThumbnailPanel ? 'thumbnail' :
+              showViralPanel ? 'viral' :
+              showRepurposePanel ? 'repurpose' :
+              showRemotionPanel ? 'remotion' :
+              null
+            }
+          />
         </div>
       </header>
 
@@ -2653,6 +2655,7 @@ export default function Home() {
               duration={duration}
               isPlaying={isPlaying}
               aspectRatio={aspectRatio}
+              sessionId={session?.sessionId}
               onSelectClip={handleSelectClip}
               onTimeChange={handleTimelineSeek}
               onPlayPause={handlePlayPause}
@@ -2686,115 +2689,64 @@ export default function Home() {
           side="right"
         >
           <div className="h-full flex flex-col bg-zinc-900/80 backdrop-blur-sm">
-            {/* Agent Tabs */}
-            <div className="flex items-center gap-1 px-2 border-b border-zinc-800/50">
-              <button
-                onClick={() => setActiveAgent('director')}
-                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors ${
-                  activeAgent === 'director'
-                    ? 'text-orange-500 border-b-2 border-orange-500 bg-zinc-800/30'
-                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
-                }`}
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                Director
-              </button>
-              <button
-                onClick={() => setActiveAgent('picasso')}
-                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors ${
-                  activeAgent === 'picasso'
-                    ? 'text-orange-300 border-b-2 border-orange-300 bg-zinc-800/30'
-                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
-                }`}
-              >
-                <Palette className="w-3.5 h-3.5" />
-                Picasso
-              </button>
-              <button
-                onClick={() => setActiveAgent('dicaprio')}
-                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors ${
-                  activeAgent === 'dicaprio'
-                    ? 'text-zinc-300 border-b-2 border-zinc-300 bg-zinc-800/30'
-                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
-                }`}
-              >
-                <Film className="w-3.5 h-3.5" />
-                DiCaprio
-              </button>
+            {/* AI Director Panel Header */}
+            <div className="flex items-center gap-2 px-3 py-2 border-b border-zinc-800/50">
+              <Sparkles className="w-4 h-4 text-orange-500" />
+              <span className="text-sm font-medium text-zinc-200">AI Director</span>
+              <span className="text-[10px] text-zinc-500 ml-auto">Cmd+K for quick actions</span>
             </div>
 
-            {/* AI Chat Panels - both mounted to preserve state, hidden via CSS */}
-            <div className="flex-1 overflow-hidden relative">
-              <div className={`absolute inset-0 ${activeAgent === 'director' ? '' : 'hidden'}`}>
-                <AIPromptPanel
-                  onApplyEdit={handleApplyEdit}
-                  onExtractKeywordsAndAddGifs={handleExtractKeywordsAndAddGifs}
-                  onTranscribeAndAddCaptions={handleTranscribeAndAddCaptions}
-                  onGenerateBroll={handleGenerateBroll}
-                  onRemoveDeadAir={handleRemoveDeadAir}
-                  onChapterCuts={handleChapterCuts}
-                  onAddMotionGraphic={handleAddMotionGraphicFromPrompt}
-                  onCreateCustomAnimation={handleCreateCustomAnimation}
-                  onUploadAttachment={uploadAsset}
-                  onAnalyzeForAnimation={handleAnalyzeForAnimation}
-                  onRenderFromConcept={handleRenderFromConcept}
-                  onGenerateTranscriptAnimation={handleGenerateTranscriptAnimation}
-                  onGenerateBatchAnimations={handleGenerateBatchAnimations}
-                  onExtractAudio={handleExtractAudio}
-                  onUndoWorkflow={handleUndoWorkflow}
-                  onPreviewBatchAnimations={handlePreviewBatchAnimations}
-                  onApplyBatchAnimations={handleApplyBatchAnimations}
-                  onCreateContextualAnimation={handleCreateContextualAnimation}
-                  onOpenAnimationInTab={handleOpenAnimationInTab}
-                  onEditAnimation={handleEditAnimation}
-                  isApplying={isProcessing}
-                  applyProgress={0}
-                  applyStatus={currentStatus}
-                  hasVideo={assets.some(a => a.type === 'video')}
-                  clips={clips}
-                  tracks={tracks}
-                  assets={assets}
-                  currentTime={currentTime}
-                  selectedClipId={selectedClipId}
-                  activeTabId={activeTabId}
-                  editTabAssetId={activeTabId !== 'main' ? timelineTabs.find(t => t.id === activeTabId)?.assetId : undefined}
-                  editTabClips={activeTabId !== 'main' ? timelineTabs.find(t => t.id === activeTabId)?.clips : undefined}
-                  captionData={captionData}
-                  onUpdateCaptionWords={updateCaptionWords}
-                  onSceneDetect={handleSceneDetect}
-                  onApplySceneCuts={handleApplySceneCuts}
-                  onMuteFillerWords={handleMuteFillerWords}
-                  onResequence={handleResequence}
-                  onApplyResequence={handleApplyResequence}
-                  onAutoReframe={handleAutoReframe}
-                  onAutoDuck={handleAutoDuck}
-                  onExportSRT={handleExportSRT}
-                  onSilencePreview={handleSilencePreview}
-                  onHighlightReel={handleHighlightReel}
-                  onTranslateCaptions={handleTranslateCaptions}
-                  onGenerateThumbnail={handleGenerateThumbnail}
-                  onWaveformData={handleWaveformData}
-                />
-              </div>
-              <div className={`absolute inset-0 ${activeAgent === 'picasso' ? '' : 'hidden'}`}>
-                <PicassoPanel
-                  sessionId={session?.sessionId ?? null}
-                  onImageGenerated={(assetId) => {
-                    console.log('Image generated:', assetId);
-                  }}
-                  onRefreshAssets={refreshAssets}
-                />
-              </div>
-              <div className={`absolute inset-0 ${activeAgent === 'dicaprio' ? '' : 'hidden'}`}>
-                <DiCaprioPanel
-                  sessionId={session?.sessionId ?? null}
-                  assets={assets}
-                  onVideoGenerated={(assetId) => {
-                    console.log('Video generated:', assetId);
-                  }}
-                  onRefreshAssets={refreshAssets}
-                />
-              </div>
+            {/* AI Director Panel */}
+            <div className="flex-1 overflow-hidden">
+              <AIPromptPanel
+                onApplyEdit={handleApplyEdit}
+                onExtractKeywordsAndAddGifs={handleExtractKeywordsAndAddGifs}
+                onTranscribeAndAddCaptions={handleTranscribeAndAddCaptions}
+                onGenerateBroll={handleGenerateBroll}
+                onRemoveDeadAir={handleRemoveDeadAir}
+                onChapterCuts={handleChapterCuts}
+                onAddMotionGraphic={handleAddMotionGraphicFromPrompt}
+                onCreateCustomAnimation={handleCreateCustomAnimation}
+                onUploadAttachment={uploadAsset}
+                onAnalyzeForAnimation={handleAnalyzeForAnimation}
+                onRenderFromConcept={handleRenderFromConcept}
+                onGenerateTranscriptAnimation={handleGenerateTranscriptAnimation}
+                onGenerateBatchAnimations={handleGenerateBatchAnimations}
+                onExtractAudio={handleExtractAudio}
+                onUndoWorkflow={handleUndoWorkflow}
+                onPreviewBatchAnimations={handlePreviewBatchAnimations}
+                onApplyBatchAnimations={handleApplyBatchAnimations}
+                onCreateContextualAnimation={handleCreateContextualAnimation}
+                onOpenAnimationInTab={handleOpenAnimationInTab}
+                onEditAnimation={handleEditAnimation}
+                isApplying={isProcessing}
+                applyProgress={0}
+                applyStatus={currentStatus}
+                hasVideo={assets.some(a => a.type === 'video')}
+                clips={clips}
+                tracks={tracks}
+                assets={assets}
+                currentTime={currentTime}
+                selectedClipId={selectedClipId}
+                activeTabId={activeTabId}
+                editTabAssetId={activeTabId !== 'main' ? timelineTabs.find(t => t.id === activeTabId)?.assetId : undefined}
+                editTabClips={activeTabId !== 'main' ? timelineTabs.find(t => t.id === activeTabId)?.clips : undefined}
+                captionData={captionData}
+                onUpdateCaptionWords={updateCaptionWords}
+                onSceneDetect={handleSceneDetect}
+                onApplySceneCuts={handleApplySceneCuts}
+                onMuteFillerWords={handleMuteFillerWords}
+                onResequence={handleResequence}
+                onApplyResequence={handleApplyResequence}
+                onAutoReframe={handleAutoReframe}
+                onAutoDuck={handleAutoDuck}
+                onExportSRT={handleExportSRT}
+                onSilencePreview={handleSilencePreview}
+                onHighlightReel={handleHighlightReel}
+                onTranslateCaptions={handleTranslateCaptions}
+                onGenerateThumbnail={handleGenerateThumbnail}
+                onWaveformData={handleWaveformData}
+              />
             </div>
           </div>
         </ResizablePanel>
@@ -2966,6 +2918,13 @@ export default function Home() {
           onAssetCreated={refreshAssets}
         />
       )}
+
+      {/* Command Bar (Cmd+K) */}
+      <CommandBar
+        isOpen={showCommandBar}
+        onClose={() => setShowCommandBar(false)}
+        onRunCommand={handleCommandBarCommand}
+      />
 
     </div>
   );

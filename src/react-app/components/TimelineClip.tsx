@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { Film, Image, Music, X, Type, Sparkles } from 'lucide-react';
 import type { TimelineClip as TimelineClipType, Asset } from '@/react-app/hooks/useProject';
+import AudioWaveform from './AudioWaveform';
 
 interface TimelineClipProps {
   clip: TimelineClipType;
@@ -8,6 +9,7 @@ interface TimelineClipProps {
   pixelsPerSecond: number;
   isSelected: boolean;
   trackHeight: number;
+  sessionId?: string;  // For fetching waveform data
   onClick: () => void;
   onMove: (newStart: number) => void;
   onResize: (newInPoint: number, newOutPoint: number, newStart?: number) => void;
@@ -43,6 +45,7 @@ export default function TimelineClip({
   pixelsPerSecond,
   isSelected,
   trackHeight,
+  sessionId,
   onClick,
   onMove,
   onResize,
@@ -221,18 +224,15 @@ export default function TimelineClip({
         )}
 
         {/* Waveform visualization for audio clips */}
-        {asset?.type === 'audio' && width > 60 && (
-          <div className="flex-1 flex items-center gap-px overflow-hidden opacity-60 min-w-0" style={{ height: '70%' }}>
-            {Array.from({ length: Math.min(Math.floor((width - 40) / 3), 60) }, (_, i) => {
-              const h = 20 + Math.abs(Math.sin(i * 0.7 + 1.3) * 50 + Math.sin(i * 1.9) * 30);
-              return (
-                <div
-                  key={i}
-                  className="flex-shrink-0 w-0.5 bg-white/80 rounded-full"
-                  style={{ height: `${Math.min(h, 85)}%`, alignSelf: 'center' }}
-                />
-              );
-            })}
+        {asset?.type === 'audio' && width > 60 && sessionId && (
+          <div className="flex-1 overflow-hidden opacity-70 min-w-0">
+            <AudioWaveform
+              sessionId={sessionId}
+              assetId={asset.id}
+              width={Math.max(width - 50, 30)}
+              height={trackHeight - 16}
+              color="rgba(255, 255, 255, 0.85)"
+            />
           </div>
         )}
         {/* Name or Caption Preview */}
